@@ -1,0 +1,311 @@
+const $ = (id) => document.getElementById(id);
+
+const slots = [$("slot1"), $("slot2"), $("slot3"), $("slot4"), $("slot5"), $("slot6")];
+const slotArt = [$("slot1art"), $("slot2art"), $("slot3art"), $("slot4art"), $("slot5art"), $("slot6art")];
+const statusEl = $("status");
+const errorEl = $("error");
+const go = $("go");
+
+function showError(msg) {
+  errorEl.hidden = !msg;
+  errorEl.textContent = msg || "";
+}
+
+function esc(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function spriteSlug(name) {
+  let s = String(name || "").trim().toLowerCase();
+  s = s.replace(/^mega\s+/, "");
+  s = s.replace(/\s+mega\s*([xy])?$/, (_, xy) => "-mega" + (xy || ""));
+  s = s.replace(/['.]/g, "");
+  s = s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  s = s.replace(/-mega-([xy])$/, "-mega$1");
+  s = s.replace(/-rapid-strike$/, "-rapidstrike");
+  s = s.replace(/-dawn-wings$/, "-dawnwings");
+  s = s.replace(/-dusk-mane$/, "-duskmane");
+  s = s.replace(/-paldea-([a-z]+)$/, "-paldea$1");
+  return s;
+}
+
+function itemSlug(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/['.]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function pokeSrcs(name) {
+  const slug = spriteSlug(name);
+  return [
+    `https://play.pokemonshowdown.com/sprites/dex/${slug}.png`,
+    `https://play.pokemonshowdown.com/sprites/gen5/${slug}.png`,
+    `https://play.pokemonshowdown.com/sprites/home/${slug}.png`,
+  ];
+}
+
+function itemSrcs(name) {
+  const slug = itemSlug(name);
+  if (!slug) return [];
+  return [
+    `https://play.pokemonshowdown.com/sprites/itemicons/${slug}.png`,
+    `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/${slug}.png`,
+    `https://img.pokemondb.net/sprites/items/${slug}.png`,
+  ];
+}
+
+function fallbackImg(img) {
+  const rest = (img.dataset.alts || "").split(",").filter(Boolean);
+  if (!rest.length) {
+    img.hidden = true;
+    img.removeAttribute("src");
+    return;
+  }
+  img.dataset.alts = rest.slice(1).join(",");
+  img.src = rest[0];
+}
+
+window.fallbackImg = fallbackImg;
+
+function imgTag(name, kind, cls) {
+  const srcs = kind === "item" ? itemSrcs(name) : pokeSrcs(name);
+  if (!srcs.length) return "";
+  return `<img class="${cls}" alt="${esc(name)}" src="${srcs[0]}" data-alts="${esc(srcs.slice(1).join(","))}" onerror="fallbackImg(this)">`;
+}
+
+function previewSeed(input, art) {
+  const name = input.value.trim();
+  if (!name) {
+    art.hidden = true;
+    art.removeAttribute("src");
+    return;
+  }
+  const srcs = pokeSrcs(name);
+  art.hidden = false;
+  art.dataset.alts = srcs.slice(1).join(",");
+  art.alt = name;
+  art.src = srcs[0];
+}
+
+slots.forEach((el, i) => {
+  el.addEventListener("input", () => previewSeed(el, slotArt[i]));
+  el.addEventListener("change", () => previewSeed(el, slotArt[i]));
+});
+
+function maxMegasFromForm() {
+  const picked = document.querySelector('input[name="maxMegas"]:checked');
+  return Number((picked && picked.value) || 2);
+}
+
+async function waitForData() {
+  for (;;) {
+    try {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      if (data.ready) {
+        statusEl.textContent = `${data.teams} unique 6-mon teams · ${data.pokemon} Pokémon in corpus`;
+        go.disabled = false;
+        const poke = await (await fetch("/api/pokemon")).json();
+        $("dex").innerHTML = (poke.names || [])
+          .map((n) => `<option value="${esc(n)}"></option>`)
+          .join("");
+        return;
+      }
+      if (data.error) {
+        statusEl.textContent = "Could not load battle data.";
+        showError(data.error);
+        return;
+      }
+      statusEl.textContent = "Loading battle data…";
+    } catch (err) {
+      statusEl.textContent = "Waiting for server…";
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+}
+
+function seedsFromForm() {
+  return slots.map((el) => el.value.trim()).filter(Boolean);
+}
+
+function addPartner(name) {
+  const empty = slots.find((el) => !el.value.trim());
+  if (!empty) {
+    showError("All six slots are full. Clear one first.");
+    return;
+  }
+  empty.value = name;
+  previewSeed(empty, slotArt[slots.indexOf(empty)]);
+}
+
+$("builder").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  showError("");
+  const seeds = seedsFromForm();
+  if (!seeds.length) {
+    showError("Pick at least one Pokémon.");
+    return;
+  }
+  go.disabled = true;
+  go.textContent = "Working…";
+  try {
+    const res = await fetch("/api/recommend", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        seeds,
+        max_megas: maxMegasFromForm(),
+        top_n: 8,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showError(data.error || "Recommendation failed.");
+      hideResults();
+      return;
+    }
+    render(data);
+  } catch (err) {
+    showError(String(err));
+  } finally {
+    go.disabled = false;
+    go.textContent = "Recommend";
+  }
+});
+
+function hideResults() {
+  ["resolved", "partners", "why", "sets", "team"].forEach((id) => {
+    $(id).hidden = true;
+  });
+}
+
+function render(data) {
+  $("resolvedList").innerHTML = data.resolved
+    .map((r) => {
+      const item = r.item
+        ? `<span class="item-line">${imgTag(r.item, "item", "item-inline")} ${esc(r.item)}</span>`
+        : "";
+      return `<div class="chip">
+        <div class="art-wrap">${imgTag(r.canonical || r.query, "poke", "sprite sm")}</div>
+        <div class="body">
+          <div class="name">${esc(r.label)}</div>
+          <div class="meta">${esc(r.kind)} · support ${Math.round(r.support)}</div>
+          ${item}
+        </div>
+      </div>`;
+    })
+    .join("");
+  $("resolved").hidden = false;
+
+  $("partnerList").innerHTML = (data.partners || [])
+    .map((p) => `<button type="button" class="card partner" data-add="${esc(p.pokemon)}">
+      <div class="art-wrap">${imgTag(p.pokemon, "poke", "sprite")}</div>
+      <div class="body">
+        <div class="name">${esc(p.pokemon)} <span class="pill ${esc(p.confidence || "")}">${esc(p.confidence || "")}</span></div>
+        <div class="meta">lift ${esc(p.avg_lift)} · together ${esc(p.avg_together_pct)}</div>
+        <div class="meta">anchors ${esc(p.anchor_coverage_pct)} · WR ${esc(p.pair_winrate_pct || "—")}</div>
+      </div>
+    </button>`).join("") || `<p class="meta">No partners with enough sample size.</p>`;
+  $("partners").hidden = false;
+  $("partnerList").querySelectorAll("[data-add]").forEach((btn) => {
+    btn.addEventListener("click", () => addPartner(btn.dataset.add));
+  });
+
+  const why = data.why || {};
+  $("whySummary").textContent = why.summary || "";
+  $("whyList").innerHTML = (why.points || [])
+    .map((pt) => {
+      const art = pt.pokemon
+        ? `<div class="art-wrap">${imgTag(pt.pokemon, "poke", "sprite sm")}</div>`
+        : "";
+      return `<li class="chip">
+        ${art}
+        <div class="body">
+          <div class="name">${esc(pt.title || "")}</div>
+          <div class="meta">${esc(pt.text || "")}</div>
+        </div>
+      </li>`;
+    })
+    .join("");
+  $("why").hidden = !(why.summary || (why.points && why.points.length));
+
+  $("setList").innerHTML = (data.sets || [])
+    .map((s) => {
+      const items = (s.items || [])
+        .map((i) => `<span class="item-line">${imgTag(i.name, "item", "item-inline")} ${esc(i.name)}</span>`)
+        .join("") || "—";
+      const moves = (s.moves || []).map((m) => esc(m.name)).join(", ") || "—";
+      const tag = s.fallback ? `fallback=${s.fallback}` : `slice n=${Math.round(s.n_teams)}`;
+      return `<div class="card">
+        <div class="chip">
+          <div class="art-wrap">${imgTag(s.species, "poke", "sprite")}</div>
+          <div class="body">
+            <div class="name">${esc(s.species)} <span class="pill ${esc(s.confidence)}">${esc(s.confidence)}</span></div>
+            <div class="meta">${esc(tag)}${s.winrate_pct ? " · WR " + esc(s.winrate_pct) : ""}</div>
+          </div>
+        </div>
+        <div class="meta" style="margin-top:8px">${items}</div>
+        <div class="meta">Moves: ${moves}</div>
+      </div>`;
+    })
+    .join("");
+  $("sets").hidden = false;
+
+  const team = data.team || {};
+  $("slotCards").innerHTML = (team.slots || [])
+    .map((slot) => {
+      const colors = slot.type_colors || [];
+      let bg = "";
+      if (colors.length >= 2) {
+        bg = `background: linear-gradient(135deg, ${colors[0]} 0%, ${colors[0]} 42%, ${colors[1]} 58%, ${colors[1]} 100%);`;
+      } else if (colors.length === 1) {
+        bg = `background: ${colors[0]};`;
+      }
+      const typePills = (slot.types || [])
+        .map((t, i) => {
+          const c = colors[i] || "#ddd";
+          return `<span class="type-pill" style="background:${c}">${esc(t)}</span>`;
+        })
+        .join("");
+      return `<div class="card typed" style="${bg}">
+      <div class="chip">
+        <div class="art-wrap">
+          ${imgTag(slot.species, "poke", "sprite")}
+          ${slot.item ? imgTag(slot.item, "item", "item-icon") : ""}
+        </div>
+        <div class="body">
+          <div class="name">${esc(slot.species)} <span class="pill ${esc(slot.confidence)}">${esc(slot.confidence)}</span></div>
+          <div class="type-row">${typePills}</div>
+          <div class="meta">${esc(slot.item || "No item")}</div>
+          <div class="meta">${[slot.ability, slot.nature && "Align " + slot.nature, slot.stat_points && "SP " + slot.stat_points].filter(Boolean).map(esc).join(" · ")}</div>
+        </div>
+      </div>
+      <ul class="moves">${(slot.moves || []).map((m) => `<li>- ${esc(m)}</li>`).join("")}</ul>
+      ${slot.notes && slot.notes.length ? `<div class="notes">${esc(slot.notes.join("; "))}</div>` : ""}
+    </div>`;
+    })
+    .join("");
+  $("paste").textContent = team.paste || "";
+  $("team").hidden = false;
+}
+
+$("copy").addEventListener("click", async () => {
+  const text = $("paste").textContent;
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    $("copy").textContent = "Copied";
+    setTimeout(() => { $("copy").textContent = "Copy paste"; }, 1200);
+  } catch {
+    showError("Could not copy — select the paste box instead.");
+  }
+});
+
+waitForData();

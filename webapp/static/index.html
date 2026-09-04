@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Champions VGC Team Checker</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <h1>Champions VGC Team Checker</h1>
+      <p class="lede">Pick 1–6 Pokémon. Empty slots get filled; a full team just gets sets and a paste.</p>
+      <p id="status" class="status">Loading battle data…</p>
+    </header>
+
+    <form id="builder" autocomplete="off">
+      <div class="seed-grid">
+        <label class="seed">
+          <span class="subheader">1</span>
+          <span class="seed-row">
+            <img id="slot1art" class="seed-art" alt="" hidden />
+            <input id="slot1" name="slot1" list="dex" placeholder="e.g. Garchomp" />
+          </span>
+        </label>
+        <label class="seed">
+          <span class="subheader">2</span>
+          <span class="seed-row">
+            <img id="slot2art" class="seed-art" alt="" hidden />
+            <input id="slot2" name="slot2" list="dex" placeholder="e.g. Incineroar" />
+          </span>
+        </label>
+        <label class="seed">
+          <span class="subheader">3</span>
+          <span class="seed-row">
+            <img id="slot3art" class="seed-art" alt="" hidden />
+            <input id="slot3" name="slot3" list="dex" placeholder="e.g. Floette-Mega" />
+          </span>
+        </label>
+        <label class="seed">
+          <span class="subheader">4</span>
+          <span class="seed-row">
+            <img id="slot4art" class="seed-art" alt="" hidden />
+            <input id="slot4" name="slot4" list="dex" placeholder="optional" />
+          </span>
+        </label>
+        <label class="seed">
+          <span class="subheader">5</span>
+          <span class="seed-row">
+            <img id="slot5art" class="seed-art" alt="" hidden />
+            <input id="slot5" name="slot5" list="dex" placeholder="optional" />
+          </span>
+        </label>
+        <label class="seed">
+          <span class="subheader">6</span>
+          <span class="seed-row">
+            <img id="slot6art" class="seed-art" alt="" hidden />
+            <input id="slot6" name="slot6" list="dex" placeholder="optional" />
+          </span>
+        </label>
+      </div>
+
+      <datalist id="dex"></datalist>
+
+      <fieldset class="megas">
+        <legend>Mega stones on the Bring-6</legend>
+        <label><input type="radio" name="maxMegas" value="1" /> 1</label>
+        <label><input type="radio" name="maxMegas" value="2" checked /> 2</label>
+        <label><input type="radio" name="maxMegas" value="0" /> Any</label>
+        <p class="hint mega-note">Battle still mega-evolves one at a time. Many lists still carry two stones — Worlds 2026 used Floette-Mega + Dragonite-Mega.</p>
+      </fieldset>
+
+      <button type="submit" id="go" disabled>Recommend</button>
+    </form>
+
+    <p id="error" class="error" hidden></p>
+
+    <section id="resolved" hidden>
+      <h2 class="subheader">Resolved names</h2>
+      <div id="resolvedList" class="grid chips"></div>
+    </section>
+
+    <div class="split">
+      <section id="partners" hidden>
+        <h2 class="subheader">Recommended partners</h2>
+        <p class="hint">Click a card to add it to the next empty slot.</p>
+        <div id="partnerList" class="grid partners"></div>
+      </section>
+
+      <section id="why" hidden>
+        <h2 class="subheader">Why these recommendations</h2>
+        <p id="whySummary" class="hint"></p>
+        <ul id="whyList" class="why-list"></ul>
+      </section>
+    </div>
+
+    <section id="sets" hidden>
+      <h2 class="subheader">Sets for this core</h2>
+      <div id="setList" class="grid sets"></div>
+    </section>
+
+    <section id="team" hidden>
+      <h2 class="subheader">Recommended Team:</h2>
+      <p class="hint">Stat Points = Champions EVs · Stat Alignment = Nature</p>
+      <div class="team-split">
+        <div id="slotCards" class="grid team"></div>
+        <div class="paste-col">
+          <pre id="paste" class="paste"></pre>
+          <button type="button" id="copy">Copy paste</button>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
