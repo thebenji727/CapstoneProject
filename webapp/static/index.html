@@ -4,13 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Champions VGC Team Checker</title>
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=mc-moves2" />
 </head>
 <body>
   <main class="page">
     <header class="hero">
       <h1>Champions VGC Team Checker</h1>
-      <p class="lede">Pick 1–6 Pokémon. Empty slots get filled; a full team just gets sets and a paste.</p>
+      <p class="lede">Champions VGC Regulation M-C. Pick 1–6 Pokémon. Empty slots get filled; a full team just gets sets and a paste.</p>
       <p id="status" class="status">Loading battle data…</p>
     </header>
 
@@ -22,12 +22,20 @@
             <img id="slot1art" class="seed-art" alt="" hidden />
             <input id="slot1" name="slot1" list="dex" placeholder="e.g. Garchomp" />
           </span>
+          <span class="move-row">
+            <span class="move-label">Move</span>
+            <input id="slot1move" class="seed-move" name="slot1move" list="moves1" placeholder="e.g. Fake Out" />
+          </span>
         </label>
         <label class="seed">
           <span class="subheader">2</span>
           <span class="seed-row">
             <img id="slot2art" class="seed-art" alt="" hidden />
             <input id="slot2" name="slot2" list="dex" placeholder="e.g. Incineroar" />
+          </span>
+          <span class="move-row">
+            <span class="move-label">Move</span>
+            <input id="slot2move" class="seed-move" name="slot2move" list="moves2" placeholder="e.g. Parting Shot" />
           </span>
         </label>
         <label class="seed">
@@ -61,6 +69,8 @@
       </div>
 
       <datalist id="dex"></datalist>
+      <datalist id="moves1"></datalist>
+      <datalist id="moves2"></datalist>
 
       <fieldset class="megas">
         <legend>Mega stones on the Bring-6</legend>
@@ -111,6 +121,6 @@
       </div>
     </section>
   </main>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=mc-moves2"></script>
 </body>
 </html>

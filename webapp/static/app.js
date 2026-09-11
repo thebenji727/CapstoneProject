@@ -22,10 +22,10 @@ function esc(value) {
 function spriteSlug(name) {
   let s = String(name || "").trim().toLowerCase();
   s = s.replace(/^mega\s+/, "");
-  s = s.replace(/\s+mega\s*([xy])?$/, (_, xy) => "-mega" + (xy || ""));
+  s = s.replace(/\s+mega\s*([xyz])?$/, (_, xyz) => "-mega" + (xyz || ""));
   s = s.replace(/['.]/g, "");
   s = s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  s = s.replace(/-mega-([xy])$/, "-mega$1");
+  s = s.replace(/-mega-([xyz])$/, "-mega$1");
   s = s.replace(/-rapid-strike$/, "-rapidstrike");
   s = s.replace(/-dawn-wings$/, "-dawnwings");
   s = s.replace(/-dusk-mane$/, "-duskmane");
@@ -94,9 +94,43 @@ function previewSeed(input, art) {
   art.src = srcs[0];
 }
 
+function ensureMoveFields() {
+  if (!document.getElementById("move-field-css")) {
+    const css = document.createElement("style");
+    css.id = "move-field-css";
+    css.textContent =
+      ".move-row{display:flex;align-items:center;gap:8px;margin-top:8px}" +
+      ".move-label{flex:0 0 40px;font-size:12px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.04em}" +
+      "form input.seed-move{margin-top:0;height:36px;font-size:14px;width:100%;padding:0 10px;border:1px solid #ccc;border-radius:6px}";
+    document.head.appendChild(css);
+  }
+  [1, 2].forEach((n) => {
+    if ($("slot" + n + "move")) return;
+    const seed = document.querySelector(`label.seed input#slot${n}`);
+    const host = seed && seed.closest("label.seed");
+    if (!host) return;
+    if (!$("moves" + n)) {
+      const list = document.createElement("datalist");
+      list.id = "moves" + n;
+      document.querySelector("form")?.appendChild(list);
+    }
+    const row = document.createElement("span");
+    row.className = "move-row";
+    row.innerHTML =
+      `<span class="move-label">Move</span>` +
+      `<input id="slot${n}move" class="seed-move" name="slot${n}move" list="moves${n}" placeholder="e.g. ${n === 1 ? "Fake Out" : "Parting Shot"}">`;
+    host.appendChild(row);
+  });
+}
+
+ensureMoveFields();
+
 slots.forEach((el, i) => {
   el.addEventListener("input", () => previewSeed(el, slotArt[i]));
-  el.addEventListener("change", () => previewSeed(el, slotArt[i]));
+  el.addEventListener("change", () => {
+    previewSeed(el, slotArt[i]);
+    if (i < 2) loadMoveHints(i);
+  });
 });
 
 function maxMegasFromForm() {
@@ -110,7 +144,7 @@ async function waitForData() {
       const res = await fetch("/api/status");
       const data = await res.json();
       if (data.ready) {
-        statusEl.textContent = `${data.teams} unique 6-mon teams · ${data.pokemon} Pokémon in corpus`;
+        statusEl.textContent = `${data.format_label || "Regulation M-C"} · ${data.teams} unique 6-mon teams · ${data.pokemon} Pokémon in corpus`;
         go.disabled = false;
         const poke = await (await fetch("/api/pokemon")).json();
         $("dex").innerHTML = (poke.names || [])
@@ -133,6 +167,33 @@ async function waitForData() {
 
 function seedsFromForm() {
   return slots.map((el) => el.value.trim()).filter(Boolean);
+}
+
+function seedMovesFromForm() {
+  return [0, 1].map((i) => ({
+    pokemon: slots[i].value.trim(),
+    move: (($(i === 0 ? "slot1move" : "slot2move") || {}).value || "").trim(),
+  }));
+}
+
+async function loadMoveHints(slotIndex) {
+  const input = slots[slotIndex];
+  const list = $(slotIndex === 0 ? "moves1" : "moves2");
+  if (!input || !list) return;
+  const name = input.value.trim();
+  if (!name) {
+    list.innerHTML = "";
+    return;
+  }
+  try {
+    const res = await fetch(`/api/moves?name=${encodeURIComponent(name)}`);
+    const data = await res.json();
+    list.innerHTML = (data.moves || [])
+      .map((m) => `<option value="${esc(m.name)}"></option>`)
+      .join("");
+  } catch (_) {
+    list.innerHTML = "";
+  }
 }
 
 function addPartner(name) {
@@ -161,6 +222,7 @@ $("builder").addEventListener("submit", async (ev) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         seeds,
+        seed_moves: seedMovesFromForm(),
         max_megas: maxMegasFromForm(),
         top_n: 8,
       }),

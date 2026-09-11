@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 from typing import Iterable, Iterator
 
 
-FORMAT_RANKED = "battledataregmbs3"
+FORMAT_RANKED = "gen9championsvgc2026regmc"
+FORMAT_RANKED_PREV = "battledataregmbs3"
 FORMAT_TOURS = "championstournaments"
 DEFAULT_MONTH = "2026-05"
 DEFAULT_CUTOFF = 1760
@@ -98,7 +99,7 @@ def _parse_record(record: str | None) -> tuple[int, int]:
 
 
 def _is_mega_name(name: str) -> bool:
-    return bool(re.search(r"-mega(?:-[xy])?$", _norm(name)))
+    return bool(re.search(r"-mega(?:-[xyz])?$", _norm(name)))
 
 
 def _is_mega_stone(item: str | None) -> bool:
@@ -107,7 +108,7 @@ def _is_mega_stone(item: str | None) -> bool:
     k = _norm(item)
     if "white herb" in k or "expert" in k:
         return False
-    return bool(re.search(r"(ite|nite)(?:\s+[xy])?$", k)) and "leftovers" not in k
+    return bool(re.search(r"(ite|nite)(?:\s+[xyz])?$", k)) and "leftovers" not in k
 
 
 def _family_key(name: str) -> str:
@@ -115,8 +116,8 @@ def _family_key(name: str) -> str:
     k = _norm(name)
     k = k.replace("'", "").replace(".", "")
     k = re.sub(r"^mega\s+", "", k)
-    k = re.sub(r"\s+mega(?:\s+[xy])?$", "", k)
-    k = re.sub(r"-mega(?:-[xy])?$", "", k)
+    k = re.sub(r"\s+mega(?:\s+[xyz])?$", "", k)
+    k = re.sub(r"-mega(?:-[xyz])?$", "", k)
     k = k.replace(" ", "")
     return k
 
@@ -124,7 +125,7 @@ def _family_key(name: str) -> str:
 # Forme tails that still share a species clause with the base name.
 _FORME_TAIL = re.compile(
     r"(?:"
-    r"-mega(?:-[xy])?"
+    r"-mega(?:-[xyz])?"
     r"|-alola|-galar|-hisui"
     r"|-paldea-aqua|-paldea-blaze|-paldea-combat|-paldea"
     r"|-therian|-incarnate"
@@ -859,6 +860,7 @@ class BuiltSlot:
     moves: list[str] = field(default_factory=list)
     confidence: str = "none"
     notes: list[str] = field(default_factory=list)
+    item_choices: list[tuple[str, float]] = field(default_factory=list)
 
     def as_paste(self) -> str:
         lines = [f"{self.species}" + (f" @ {self.item}" if self.item else "")]
@@ -884,6 +886,45 @@ class BuiltTeam:
 
     def as_paste(self) -> str:
         return "\n\n".join(slot.as_paste() for slot in self.slots)
+
+
+_PHYSICAL_MOVES = {
+    "fake out", "grassy glide", "wood hammer", "u-turn", "knock off", "low kick",
+    "close combat", "drain punch", "ice punch", "thunder punch", "fire punch",
+    "glaive rush", "ice shard", "icicle crash", "earthquake", "high horsepower",
+    "iron head", "rock slide", "brave bird", "flare blitz", "wave crash",
+    "liquidation", "aqua jet", "bullet punch", "sucker punch", "spirit shackle",
+    "kowtow cleave", "suckerpunch", "extreme speed", "head smash", "double-edge",
+    "double edge", "megahorn", "play rough", "spirit break", "jaw lock",
+    "crunch", "poison jab", "dire claw", "triple axel", "flower trick",
+    "drum beating", "superpower", "hammer arm", "flip turn", "rapid spin",
+}
+_SPECIAL_MOVES = {
+    "overheat", "heat wave", "flamethrower", "fire blast", "eruption",
+    "hydro pump", "surf", "muddy water", "scald", "weather ball",
+    "thunderbolt", "thunder", "discharge", "electro shot", "volt switch",
+    "ice beam", "blizzard", "freeze-dry", "draco meteor", "dragon pulse",
+    "flash cannon", "dazzling gleam", "moonblast", "shadow ball",
+    "make it rain", "energy ball", "giga drain", "leaf storm", "sludge bomb",
+    "earth power", "air slash", "hurricane", "bleakwind storm", "matcha gotcha",
+    "expanding force", "psychic", "pollen puff", "hyper voice", "boomburst",
+}
+
+
+def _infer_alignment(moves: list[str]) -> tuple[str | None, dict[str, int]]:
+    """Champions default when usage APIs have not published natures/spreads yet."""
+    phys = spec = 0
+    for mv in moves or []:
+        k = _norm(mv)
+        if k in _PHYSICAL_MOVES:
+            phys += 1
+        elif k in _SPECIAL_MOVES:
+            spec += 1
+    if phys > spec:
+        return "Adamant", {"hp": 2, "atk": 32, "spe": 32}
+    if spec > phys:
+        return "Modest", {"hp": 2, "spa": 32, "spe": 32}
+    return None, {}
 
 
 def _pick_named(rows: list[dict], key: str) -> str | None:
@@ -924,6 +965,7 @@ def fill_slot(
     *,
     detail: dict | None = None,
     pastes: TeamCorpus | None = None,
+    locked_moves: Iterable[str] = (),
 ) -> BuiltSlot:
     """Fill one Champions slot from compositions + ranked detail + pastes."""
     resolved = corpus.resolve(species)
@@ -938,11 +980,14 @@ def fill_slot(
         notes.append(f"items vs {item_prof.teammates[0]} n={item_prof.n_teams:.0f}")
     else:
         notes.append("items global")
-    top_items = item_prof.top_items(1)
-    item = top_items[0][0] if top_items else resolved.item
-
+    item_ranked = item_prof.top_items(8)
+    if resolved.item and not any(_norm(n) == _norm(resolved.item) for n, _ in item_ranked):
+        item_ranked = [(resolved.item, 1.0)] + item_ranked
     if resolved.item and _is_mega_stone(resolved.item):
-        item = resolved.item
+        item_ranked = [(resolved.item, 1.0)] + [
+            (n, s) for n, s in item_ranked if _norm(n) != _norm(resolved.item)
+        ]
+    item = item_ranked[0][0] if item_ranked else resolved.item
 
     moves: list[str] = []
     if pastes is not None:
@@ -969,6 +1014,38 @@ def fill_slot(
             if moves:
                 notes.append("moves from usage")
 
+    forced: list[str] = []
+    seen_mv = set()
+    for raw in locked_moves or ():
+        mv = " ".join(str(raw).split())
+        if not mv:
+            continue
+        k = _norm(mv)
+        if k in seen_mv:
+            continue
+        seen_mv.add(k)
+        forced.append(mv)
+    if forced:
+        kept = list(forced)
+        for mv in moves:
+            if _norm(mv) in seen_mv:
+                continue
+            kept.append(mv)
+            seen_mv.add(_norm(mv))
+            if len(kept) >= 4:
+                break
+        moves = kept[:4]
+        notes.append("locked move: " + ", ".join(forced))
+
+    if not nature or not spread:
+        inf_nat, inf_sp = _infer_alignment(moves)
+        if not nature and inf_nat:
+            nature = inf_nat
+            notes.append("alignment inferred (usage page has no natures yet)")
+        if not spread and inf_sp:
+            spread = inf_sp
+            notes.append("stat points inferred (usage page has no spreads yet)")
+
     confidence = item_prof.confidence
     if not moves:
         confidence = "low"
@@ -982,6 +1059,7 @@ def fill_slot(
         moves=moves,
         confidence=confidence,
         notes=notes,
+        item_choices=item_ranked,
     )
 
 
@@ -1007,7 +1085,18 @@ def _detail_from_official(name: str) -> dict | None:
     if not live.get("moves") and not live.get("items"):
         return None
     spreads = []
-    # official stat_points rows live on the raw endpoint; skip if absent
+    for row in live.get("stat_points") or []:
+        parts = [
+            int(row.get("hp_points") or 0),
+            int(row.get("attack_points") or 0),
+            int(row.get("defense_points") or 0),
+            int(row.get("sp_atk_points") or 0),
+            int(row.get("sp_def_points") or 0),
+            int(row.get("speed_points") or 0),
+        ]
+        if sum(parts) <= 0:
+            continue
+        spreads.append({"ev": "/".join(str(p) for p in parts), "percent": row.get("percentage_value")})
     return {
         "name": live.get("pokemon") or name,
         "moves": [{"move": r["name"]} for r in live.get("moves") or [] if r.get("name")],
@@ -1024,12 +1113,13 @@ def load_details(names: Iterable[str]) -> dict[str, dict]:
     for name in names:
         ranked = _safe_detail(name, FORMAT_RANKED)
         tours = _safe_detail(name, FORMAT_TOURS)
-        stripped = re.sub(r"-mega(?:-[xy])?$", "", name, flags=re.I)
+        prev = _safe_detail(name, FORMAT_RANKED_PREV)
+        stripped = re.sub(r"-mega(?:-[xyz])?$", "", name, flags=re.I)
         base = None
         if _is_mega_name(name) or (ranked and not (ranked.get("moves") and ranked.get("spreads"))):
             if stripped != name:
                 base = _safe_detail(stripped, FORMAT_RANKED)
-        merged = _merge_detail(ranked, tours, base)
+        merged = _merge_detail(ranked, tours, prev, base)
         if not (merged.get("moves") and merged.get("spreads")):
             merged = _merge_detail(
                 merged,
@@ -1075,6 +1165,81 @@ def _swap_off_megastone(corpus: TeamCorpus, slot: BuiltSlot, teammates: list[str
             break
     slot.item = alt
     slot.notes.append("megastone dropped (cap)")
+    if alt and not any(_norm(n) == _norm(alt) for n, _ in slot.item_choices):
+        slot.item_choices = [(alt, 0.0)] + [
+            (n, s) for n, s in slot.item_choices if not _is_mega_stone(n)
+        ]
+
+
+def _assign_unique_items(slots: list[BuiltSlot]) -> None:
+    """One copy of each item on the Bring-6.
+
+    The Pokémon whose top remaining item is furthest ahead of its
+    next legal option keeps the contested item; everyone else steps
+    down their usage list.
+    """
+    used: set[str] = set()
+
+    def key(item: str | None) -> str:
+        return _norm(item or "")
+
+    def menu(slot: BuiltSlot) -> list[tuple[str, float]]:
+        rows: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for name, share in slot.item_choices:
+            k = key(name)
+            if not name or k in seen:
+                continue
+            seen.add(k)
+            rows.append((name, share))
+        if slot.item and key(slot.item) not in seen:
+            rows.insert(0, (slot.item, 1.0))
+        return rows
+
+    def open_rows(slot: BuiltSlot) -> list[tuple[str, float]]:
+        out = []
+        for name, share in menu(slot):
+            if key(name) in used:
+                continue
+            if _is_mega_stone(name) and not (
+                _is_mega_name(slot.species) or _is_mega_stone(slot.item)
+            ):
+                continue
+            out.append((name, share))
+        return out
+
+    def urgency(slot: BuiltSlot) -> tuple[float, float]:
+        rows = open_rows(slot)
+        if not rows:
+            return (0.0, 0.0)
+        top = rows[0][1]
+        nxt = rows[1][1] if len(rows) > 1 else 0.0
+        return (top - nxt, top)
+
+    # Lock megastones first — they are species-specific and unique by name.
+    for slot in slots:
+        if slot.item and _is_mega_stone(slot.item):
+            used.add(key(slot.item))
+
+    pending = [
+        s for s in slots if not (s.item and _is_mega_stone(s.item))
+    ]
+    while pending:
+        pending.sort(key=urgency, reverse=True)
+        slot = pending.pop(0)
+        rows = open_rows(slot)
+        if not rows:
+            if slot.item and key(slot.item) in used:
+                slot.notes.append(f"{slot.item} already on the team; no unique fallback")
+                slot.item = None
+            continue
+        pick, share = rows[0]
+        if slot.item and key(pick) != key(slot.item):
+            slot.notes.append(
+                f"{slot.item} taken by a teammate who needs it more → {pick} ({share:.0%})"
+            )
+        slot.item = pick
+        used.add(key(pick))
 
 
 def _apply_mega_cap(
@@ -1106,6 +1271,7 @@ def build_team(
     pastes: TeamCorpus | None = None,
     one_mega: bool | None = None,
     max_megas: int | None = None,
+    locked_moves: dict[str, Iterable[str]] | None = None,
 ) -> BuiltTeam:
     """Grow a partial core into a full Champions Bring-6 team.
 
@@ -1149,11 +1315,23 @@ def build_team(
         seen_families.add(_species_clause_key(picked))
 
     details = load_details(names)
+    locks = locked_moves or {}
     slots = []
     for species in names:
         detail = details.get(_norm(species))
-        slots.append(fill_slot(corpus, species, names, detail=detail, pastes=pastes))
+        forced = locks.get(_norm(species)) or locks.get(species) or ()
+        slots.append(
+            fill_slot(
+                corpus,
+                species,
+                names,
+                detail=detail,
+                pastes=pastes,
+                locked_moves=forced,
+            )
+        )
     _apply_mega_cap(corpus, slots, seed_count=seed_count, max_megas=cap)
+    _assign_unique_items(slots)
     return BuiltTeam(slots=slots, resolved=resolved)
 
 
@@ -1175,6 +1353,7 @@ def official_doubles(name: str, season: str = "Current") -> dict:
         "abilities": bucket.get("ability", []),
         "teammates": bucket.get("teammate", []),
         "natures": bucket.get("stat_alignment", []),
+        "stat_points": bucket.get("stat_points", []),
     }
 
 
@@ -1520,11 +1699,18 @@ def load_teambuilder_data(
     bags: list[TeamCorpus] = []
     pastes = TeamCorpus()
     if include_usage:
-        bags.append(load_team_usage(FORMAT_TOURS))
+        bags.append(load_team_usage(FORMAT_RANKED))
     if include_sample_pastes:
-        sample = load_sample_pastes(FORMAT_TOURS)
-        bags.append(sample)
-        pastes.extend(sample.teams)
+        seen_paste = set()
+        for fmt in (FORMAT_RANKED, FORMAT_TOURS):
+            sample = load_sample_pastes(fmt)
+            bags.append(sample)
+            for team in sample.teams:
+                sig = tuple(sorted(m.key for m in team.members))
+                if sig in seen_paste:
+                    continue
+                seen_paste.add(sig)
+                pastes.add(team)
     if include_worlds:
         worlds = load_worlds(2026)
         bags.append(worlds)

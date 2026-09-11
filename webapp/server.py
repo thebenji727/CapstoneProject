@@ -20,7 +20,7 @@ import traceback
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -72,7 +72,7 @@ def _dex_key(name: str) -> str:
     s = (name or "").strip().lower()
     s = s.replace("’", "'").replace(".", "")
     s = re.sub(r"^mega\s+", "", s)
-    s = re.sub(r"\s+mega(?:\s+([xy]))?$", lambda m: "mega" + (m.group(1) or ""), s)
+    s = re.sub(r"\s+mega(?:\s+([xyz]))?$", lambda m: "mega" + (m.group(1) or ""), s)
     s = s.replace("-", "").replace(" ", "").replace("'", "")
     return s
 
@@ -125,7 +125,7 @@ def pokemon_types(name: str) -> list[str]:
 
     raw = name or ""
     keys = [_dex_key(raw)]
-    stripped = re.sub(r"-mega(?:-[xy])?$", "", raw, flags=re.I)
+    stripped = re.sub(r"-mega(?:-[xyz])?$", "", raw, flags=re.I)
     stripped = re.sub(r"^mega\s+", "", stripped, flags=re.I)
     if stripped != raw:
         keys.append(_dex_key(stripped))
@@ -287,7 +287,7 @@ def _explain(resolved, partners, sets, team, max_megas: int) -> dict:
     return {"summary": summary, "points": points}
 
 
-def _build_team(corpus, canonical, pastes, max_megas: int):
+def _build_team(corpus, canonical, pastes, max_megas: int, locked_moves=None):
     """Call build_team with max_megas when present, else the old one_mega flag."""
     params = inspect.signature(recs.build_team).parameters
     kwargs = {"pastes": pastes}
@@ -296,6 +296,8 @@ def _build_team(corpus, canonical, pastes, max_megas: int):
     elif "one_mega" in params:
         # Old team_recs.py: 1 → enforce one stone, 2/any → do not cap.
         kwargs["one_mega"] = max_megas == 1
+    if locked_moves and "locked_moves" in params:
+        kwargs["locked_moves"] = locked_moves
     return recs.build_team(corpus, canonical, **kwargs)
 
 
@@ -389,7 +391,27 @@ def _recommend(payload: dict) -> dict:
             }
         )
 
-    built = _build_team(corpus, canonical, pastes, max_megas)
+    raw_moves = payload.get("seed_moves") or payload.get("moves") or []
+    locked = {}
+    rows = []
+    if isinstance(raw_moves, dict):
+        rows = [{"pokemon": k, "move": v} for k, v in raw_moves.items()]
+    elif isinstance(raw_moves, list):
+        for i, row in enumerate(raw_moves[:2]):
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
+                poke = seeds[i] if i < len(seeds) else ""
+                rows.append({"pokemon": poke, "move": row})
+    for row in rows:
+        poke = " ".join(str(row.get("pokemon") or "").split())
+        move = " ".join(str(row.get("move") or "").split())
+        if not poke or not move:
+            continue
+        resolved_one = corpus.resolve(poke)
+        if resolved_one.canonical:
+            locked[recs._norm(resolved_one.canonical)] = [move]
+    built = _build_team(corpus, canonical, pastes, max_megas, locked_moves=locked)
     slots_out = []
     for slot in built.slots:
         types = pokemon_types(slot.species)
@@ -451,12 +473,43 @@ class Handler(SimpleHTTPRequestHandler):
                         "teams": STATE["teams"],
                         "weight": STATE["weight"],
                         "pokemon": len(STATE["names"]),
+                        "format": recs.FORMAT_RANKED,
+                        "format_label": "Regulation M-C",
                     },
                 )
             return
         if path == "/api/pokemon":
             with LOCK:
                 self._json(200, {"ready": STATE["ready"], "names": STATE["names"]})
+            return
+        if path == "/api/moves":
+            query = parse_qs(urlparse(self.path).query)
+            name = " ".join((query.get("name") or [""])[0].split())
+            if not name:
+                self._json(200, {"name": "", "moves": []})
+                return
+            with LOCK:
+                corpus = STATE["corpus"]
+                pastes = STATE["pastes"]
+            if not STATE["ready"] or corpus is None:
+                self._json(200, {"name": name, "moves": []})
+                return
+            resolved = corpus.resolve(name)
+            canon = resolved.canonical or name
+            bag: dict[str, float] = {}
+            for src in (corpus, pastes):
+                if src is None:
+                    continue
+                for mv, share in src.profile(canon, fallback=True).top_moves(16):
+                    bag[mv] = max(bag.get(mv, 0.0), share)
+            ordered = sorted(bag.items(), key=lambda kv: (-kv[1], kv[0]))
+            self._json(
+                200,
+                {
+                    "name": canon,
+                    "moves": [{"name": n, "share": p} for n, p in ordered],
+                },
+            )
             return
         if path in ("/", "/index.html"):
             self.path = "/index.html"
