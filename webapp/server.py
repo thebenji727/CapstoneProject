@@ -167,7 +167,7 @@ def _load() -> None:
         corpus, pastes = recs.load_teambuilder_data(
             include_worlds=True,
             include_official_season=False,
-            include_limitless=False,
+            include_limitless=True,
             include_usage=True,
             include_sample_pastes=True,
         )
@@ -435,6 +435,24 @@ def _recommend(payload: dict) -> dict:
         "paste": built.as_paste(),
         "slots": slots_out,
     }
+    threats = []
+    try:
+        for row in recs.threats_for_team(
+            corpus,
+            [s.species for s in built.slots] or canonical,
+            top_n=6,
+        ):
+            threats.append(
+                {
+                    "pokemon": row["pokemon"],
+                    "reason": row["reason"],
+                    "usage_pct": round(row.get("usage_pct") or 0.0, 1),
+                    "games": int(row.get("games") or 0),
+                    "vs": row.get("vs") or [],
+                }
+            )
+    except Exception:
+        threats = []
     return {
         "ok": True,
         "resolved": resolved,
@@ -442,6 +460,7 @@ def _recommend(payload: dict) -> dict:
         "sets": sets,
         "team": team,
         "why": _explain(resolved, partners, sets, team, max_megas),
+        "threats": threats,
     }
 
 

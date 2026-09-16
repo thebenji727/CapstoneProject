@@ -243,8 +243,9 @@ $("builder").addEventListener("submit", async (ev) => {
 });
 
 function hideResults() {
-  ["resolved", "partners", "why", "sets", "team"].forEach((id) => {
-    $(id).hidden = true;
+  ["resolved", "partners", "why", "sets", "threats", "team"].forEach((id) => {
+    const el = $(id);
+    if (el) el.hidden = true;
   });
 }
 
@@ -356,6 +357,33 @@ function render(data) {
     .join("");
   $("paste").textContent = team.paste || "";
   $("team").hidden = false;
+
+  let threatBox = $("threats");
+  if (!threatBox) {
+    threatBox = document.createElement("section");
+    threatBox.id = "threats";
+    threatBox.innerHTML = `<h2 class="subheader">Threats to respect</h2>
+      <p class="hint">Common M-C Pokémon that usage data marks as poor matchups for this Bring-6. Not a damage calc.</p>
+      <div id="threatList" class="grid chips"></div>`;
+    const teamBox = $("team");
+    teamBox.parentNode.insertBefore(threatBox, teamBox);
+  }
+  const threatList = $("threatList");
+  const threats = data.threats || [];
+  if (threatList) {
+    threatList.innerHTML = threats.length
+      ? threats
+          .map((t) => `<div class="chip">
+        <div class="art-wrap">${imgTag(t.pokemon, "poke", "sprite sm")}</div>
+        <div class="body">
+          <div class="name">${esc(t.pokemon)}</div>
+          <div class="meta">${esc(t.reason)}</div>
+        </div>
+      </div>`)
+          .join("")
+      : `<p class="hint">No threat slice yet — restart the server so /api/recommend includes threats.</p>`;
+  }
+  threatBox.hidden = false;
 }
 
 $("copy").addEventListener("click", async () => {

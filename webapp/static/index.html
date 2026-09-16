@@ -9,7 +9,7 @@
 <body>
   <main class="page">
     <header class="hero">
-      <h1>Champions VGC Team Recommender</h1>
+      <h1>Champions VGC Team Checker</h1>
       <p class="lede">Champions VGC Regulation M-C. Pick 1–6 Pokémon. Empty slots get filled; a full team just gets sets and a paste.</p>
       <p id="status" class="status">Loading battle data…</p>
     </header>
@@ -109,6 +109,12 @@
       <div id="setList" class="grid sets"></div>
     </section>
 
+    <section id="threats" hidden>
+      <h2 class="subheader">Threats to respect</h2>
+      <p class="hint">Common M-C Pokémon that usage data marks as poor matchups for this Bring-6. Not a damage calc.</p>
+      <div id="threatList" class="grid chips"></div>
+    </section>
+
     <section id="team" hidden>
       <h2 class="subheader">Recommended Team:</h2>
       <p class="hint">Stat Points = Champions EVs · Stat Alignment = Nature</p>
@@ -121,6 +127,6 @@
       </div>
     </section>
   </main>
-  <script src="/app.js?v=mc-moves2"></script>
+  <script src="/app.js?v=threats2"></script>
 </body>
 </html>

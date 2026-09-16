@@ -102,6 +102,16 @@ def _is_mega_name(name: str) -> bool:
     return bool(re.search(r"-mega(?:-[xyz])?$", _norm(name)))
 
 
+def _base_forme(name: str) -> str:
+    """Salamence-Mega / Garchomp-Mega-Z → Salamence / Garchomp."""
+    raw = (name or "").strip()
+    if not raw:
+        return raw
+    stripped = re.sub(r"-mega(?:-[xyz])?$", "", raw, flags=re.I)
+    stripped = re.sub(r"\s+mega(?:\s+[xyz])?$", "", stripped, flags=re.I)
+    return stripped or raw
+
+
 def _is_mega_stone(item: str | None) -> bool:
     if not item:
         return False
@@ -951,7 +961,7 @@ def _merge_detail(*blobs: dict | None) -> dict:
     for blob in blobs:
         if not blob:
             continue
-        for key in ("abilities", "natures", "moves", "spreads", "items", "name", "name_trans"):
+        for key in ("abilities", "natures", "moves", "spreads", "items", "name", "name_trans", "counters"):
             if key not in merged or not merged.get(key):
                 if blob.get(key):
                     merged[key] = blob[key]
@@ -995,7 +1005,7 @@ def fill_slot(
         pair_moves = None
         if mates:
             pair_moves = pastes.profile(name, mates[:1], fallback=False)
-        use = pair_moves if pair_moves and pair_moves.n_teams >= 3 else move_prof
+        use = pair_moves if pair_moves and pair_moves.n_teams >= 8 else move_prof
         moves = [mv for mv, _ in use.top_moves(4)]
         if moves:
             notes.append(f"moves from {use.n_teams:.0f} pastes")
@@ -1119,13 +1129,14 @@ def load_details(names: Iterable[str]) -> dict[str, dict]:
         if _is_mega_name(name) or (ranked and not (ranked.get("moves") and ranked.get("spreads"))):
             if stripped != name:
                 base = _safe_detail(stripped, FORMAT_RANKED)
-        merged = _merge_detail(ranked, tours, prev, base)
-        if not (merged.get("moves") and merged.get("spreads")):
-            merged = _merge_detail(
-                merged,
-                _detail_from_official(name),
-                _detail_from_official(stripped if stripped != name else name),
-            )
+        merged = _merge_detail(
+            ranked,
+            tours,
+            prev,
+            base,
+            _detail_from_official(name),
+            _detail_from_official(stripped if stripped != name else name),
+        )
         if not merged:
             continue
         out[_norm(name)] = merged
@@ -1154,21 +1165,26 @@ def _count_megas(corpus: TeamCorpus, names: list[str]) -> int:
 
 
 def _swap_off_megastone(corpus: TeamCorpus, slot: BuiltSlot, teammates: list[str]) -> None:
-    """Keep the species, drop the stone for a common non-mega item."""
+    """Demote a mega slot to the base forme so the cap actually sticks."""
     if not _is_mega_stone(slot.item) and not _is_mega_name(slot.species):
         return
+    old = slot.species
+    base = _base_forme(slot.species)
+    if base and _norm(base) != _norm(slot.species):
+        slot.species = base
     prof = _best_pair_profile(corpus, slot.species, teammates)
     alt = None
-    for name, _share in prof.top_items(8):
+    for name, _share in list(prof.top_items(8)) + list(slot.item_choices):
         if name and not _is_mega_stone(name):
             alt = name
             break
     slot.item = alt
-    slot.notes.append("megastone dropped (cap)")
+    slot.item_choices = [(n, s) for n, s in slot.item_choices if not _is_mega_stone(n)]
     if alt and not any(_norm(n) == _norm(alt) for n, _ in slot.item_choices):
-        slot.item_choices = [(alt, 0.0)] + [
-            (n, s) for n, s in slot.item_choices if not _is_mega_stone(n)
-        ]
+        slot.item_choices = [(alt, 0.0)] + slot.item_choices
+    note = f"{old} demoted to {slot.species} (mega cap)"
+    if note not in slot.notes:
+        slot.notes.append(note)
 
 
 def _assign_unique_items(slots: list[BuiltSlot]) -> None:
@@ -1201,9 +1217,7 @@ def _assign_unique_items(slots: list[BuiltSlot]) -> None:
         for name, share in menu(slot):
             if key(name) in used:
                 continue
-            if _is_mega_stone(name) and not (
-                _is_mega_name(slot.species) or _is_mega_stone(slot.item)
-            ):
+            if _is_mega_stone(name) and not _is_mega_name(slot.species):
                 continue
             out.append((name, share))
         return out
@@ -1303,10 +1317,11 @@ def build_team(
             fam = _species_clause_key(cand)
             if _norm(cand) in seen or fam in seen_families:
                 continue
-            cand_item = (corpus.top_item(cand) or (None, 0))[0]
-            if cap and mega_count >= cap and _is_mega_slot(cand, cand_item):
+            resolved_cand = corpus.resolve(cand).canonical or cand
+            cand_item = (corpus.top_item(resolved_cand) or (None, 0))[0]
+            if cap and mega_count >= cap and _is_mega_slot(resolved_cand, cand_item):
                 continue
-            picked = cand
+            picked = resolved_cand
             break
         if picked is None:
             break
@@ -1332,7 +1347,105 @@ def build_team(
         )
     _apply_mega_cap(corpus, slots, seed_count=seed_count, max_megas=cap)
     _assign_unique_items(slots)
+    # Unique-item pass can hand a stone back; enforce the cap again.
+    _apply_mega_cap(corpus, slots, seed_count=seed_count, max_megas=cap)
     return BuiltTeam(slots=slots, resolved=resolved)
+
+
+def threats_for_team(
+    corpus: TeamCorpus,
+    names: Iterable[str],
+    *,
+    top_n: int = 6,
+) -> list[dict]:
+    """High-usage format mons that Pikalytics marks as poor matchups for this Bring-6."""
+    resolved = [corpus.resolve(n).canonical for n in names if n]
+    resolved = [n for n in resolved if n]
+    blocked = {_norm(n) for n in resolved}
+    blocked_fam = {_species_clause_key(n) for n in resolved}
+    all_w = corpus.total_weight or 1.0
+    bag: dict[str, dict] = {}
+
+    details = load_details(resolved)
+    for mon in resolved:
+        blob = details.get(_norm(mon)) or {}
+        for row in blob.get("counters") or []:
+            name = row.get("pokemon") or row.get("pokemon_trans")
+            if not name:
+                continue
+            if _norm(name) in blocked or _species_clause_key(name) in blocked_fam:
+                continue
+            try:
+                games = float(row.get("games") or 0)
+            except (TypeError, ValueError):
+                games = 0.0
+            if games < 4:
+                continue
+            try:
+                wr = float(str(row.get("winPercent") or row.get("winRate") or 50).replace("%", ""))
+                if wr > 1:
+                    wr /= 100.0
+            except (TypeError, ValueError):
+                wr = 0.5
+            pressure = games * max(0.0, 1.0 - wr)
+            usage = max(corpus.support(name), 0.0) / all_w
+            bucket = bag.setdefault(
+                name,
+                {"pokemon": name, "pressure": 0.0, "games": 0.0, "vs": [], "usage": usage},
+            )
+            bucket["pressure"] += pressure
+            bucket["games"] += games
+            if mon not in bucket["vs"]:
+                bucket["vs"].append(mon)
+
+    rows = []
+    for name, bucket in bag.items():
+        score = bucket["pressure"] * (1.0 + 8.0 * bucket["usage"])
+        vs = bucket["vs"][:2]
+        if vs:
+            reason = "Poor recorded matchup for " + " and ".join(vs)
+        else:
+            reason = "Common in the current format"
+        if bucket["usage"] >= 0.04:
+            reason += " · high format usage"
+        rows.append(
+            {
+                "pokemon": name,
+                "score": score,
+                "games": bucket["games"],
+                "usage": bucket["usage"],
+                "usage_pct": 100.0 * bucket["usage"],
+                "vs": bucket["vs"],
+                "reason": reason,
+            }
+        )
+    rows.sort(key=lambda r: (-r["score"], -r["usage"], r["pokemon"]))
+
+    if len(rows) < top_n:
+        have = {_norm(r["pokemon"]) for r in rows}
+        extras = sorted(corpus._weight.items(), key=lambda kv: -kv[1])
+        for key, w in extras:
+            name = corpus._by_key.get(key, key)
+            if _norm(name) in blocked or _species_clause_key(name) in blocked_fam:
+                continue
+            if _norm(name) in have:
+                continue
+            usage = w / all_w
+            rows.append(
+                {
+                    "pokemon": name,
+                    "score": usage,
+                    "games": 0.0,
+                    "usage": usage,
+                    "usage_pct": 100.0 * usage,
+                    "vs": [],
+                    "reason": "Common in the current format",
+                }
+            )
+            have.add(_norm(name))
+            if len(rows) >= top_n:
+                break
+    return rows[:top_n]
 
 
 def official_doubles(name: str, season: str = "Current") -> dict:
@@ -1651,7 +1764,7 @@ def load_recent_limitless(
     max_events: int = 12,
     champions_only: bool = True,
 ) -> TeamCorpus:
-    """Finished Limitless cups large enough to matter for Reg M-B."""
+    """Finished Limitless cups large enough to matter for current Champions."""
     corpus = TeamCorpus()
     taken = 0
     for ev in list_limitless_events(pages=pages):
@@ -1660,7 +1773,9 @@ def load_recent_limitless(
         if int(ev.get("playerCount") or 0) < min_players:
             continue
         label = f"{ev.get('name') or ''} {ev.get('label') or ''} {ev.get('slug') or ''}"
-        if champions_only and not re.search(r"champion|reg\s*m-?b|vgc", label, re.I):
+        if champions_only and not re.search(
+            r"champion|reg\s*m-?[abc]|m-[abc]\b|vgc", label, re.I
+        ):
             continue
         slug = ev.get("slug")
         if not slug:
@@ -1675,11 +1790,40 @@ def load_recent_limitless(
     return corpus
 
 
+def _team_sig(team: Team) -> tuple[str, ...]:
+    return tuple(sorted(m.key for m in team.members))
+
+
+def _paste_quality(team: Team) -> int:
+    return sum(
+        len(m.moves) + (1 if m.item else 0) + (1 if m.ability else 0)
+        for m in team.members
+    )
+
+
 def merge_corpora(*corpora: TeamCorpus) -> TeamCorpus:
     out = TeamCorpus()
+    best: dict[tuple[str, ...], Team] = {}
+    order: list[tuple[str, ...]] = []
     for bag in corpora:
-        if bag is not None:
-            out.extend(bag.teams)
+        if bag is None:
+            continue
+        for team in bag.teams:
+            sig = _team_sig(team)
+            prev = best.get(sig)
+            if prev is None:
+                best[sig] = team
+                order.append(sig)
+                continue
+            if team.weight > prev.weight or (
+                team.weight == prev.weight and _paste_quality(team) > _paste_quality(prev)
+            ):
+                team.weight = max(team.weight, prev.weight)
+                best[sig] = team
+            else:
+                prev.weight = max(prev.weight, team.weight)
+    for sig in order:
+        out.add(best[sig])
     return out
 
 
@@ -1701,18 +1845,16 @@ def load_teambuilder_data(
     if include_usage:
         bags.append(load_team_usage(FORMAT_RANKED))
     if include_sample_pastes:
-        seen_paste = set()
         for fmt in (FORMAT_RANKED, FORMAT_TOURS):
             sample = load_sample_pastes(fmt)
             bags.append(sample)
-            for team in sample.teams:
-                sig = tuple(sorted(m.key for m in team.members))
-                if sig in seen_paste:
-                    continue
-                seen_paste.add(sig)
-                pastes.add(team)
+            pastes.extend(sample.teams)
     if include_worlds:
         worlds = load_worlds(2026)
+        # Worlds 2026 was Reg M-B. Keep the pastes for set fill, but do not
+        # let that older meta outvote current M-C pairing data.
+        for team in worlds.teams:
+            team.weight *= 0.35
         bags.append(worlds)
         pastes.extend(worlds.teams)
     if include_official_season:
@@ -1723,6 +1865,13 @@ def load_teambuilder_data(
         cups = load_recent_limitless()
         bags.append(cups)
         pastes.extend(cups.teams)
+    paste_best: dict[tuple[str, ...], Team] = {}
+    for team in pastes.teams:
+        sig = _team_sig(team)
+        prev = paste_best.get(sig)
+        if prev is None or _paste_quality(team) > _paste_quality(prev):
+            paste_best[sig] = team
+    pastes = TeamCorpus(list(paste_best.values()))
     return merge_corpora(*bags), pastes
 
 
