@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pikalytics_team_usage.schema.json",
+  "title": "Pikalytics team-usage groups",
+  "description": "GET https://www.pikalytics.com/api/team-usage/{format}. Format for this project: gen9championsvgc2026regmc.",
+  "type": "object",
+  "required": ["groups"],
+  "properties": {
+    "format": { "type": "string" },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pokemon"],
+        "properties": {
+          "key": { "type": "string" },
+          "uses": { "type": "number" },
+          "wins": { "type": "number" },
+          "losses": { "type": "number" },
+          "pokemon": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "pokemon": { "type": "string" },
+                "item": { "type": ["string", "null"] }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "limitless_event.schema.json",
+  "title": "Pikalytics Limitless cup",
+  "description": "List: GET /api/tournaments?page=N. One cup: GET /api/tournaments/limitless/{slug}.",
+  "type": "object",
+  "properties": {
+    "tournament": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "slug": { "type": "string" },
+        "playerCount": { "type": "integer" },
+        "status": { "type": "string" },
+        "isOngoing": { "type": "boolean" }
+      }
+    },
+    "teams": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "author": { "type": "string" },
+          "link": { "type": "string" },
+          "record": { "type": "string" },
+          "ranking": { "type": ["integer", "string", "null"] },
+          "pokemon": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "display_name": { "type": "string" },
+                "item": { "type": ["string", "null"] },
+                "ability": { "type": ["string", "null"] },
+                "moves": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      { "type": "string" },
+                      { "type": "object", "properties": { "name": { "type": "string" } } }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

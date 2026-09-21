@@ -20,10 +20,13 @@ from __future__ import annotations
 import json
 import math
 import re
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Iterable, Iterator
 
 
 FORMAT_RANKED = "gen9championsvgc2026regmc"
@@ -35,7 +38,15 @@ PIKA = "https://www.pikalytics.com"
 OFFICIAL = "https://championsbattledata.com"
 POKEDATA = "https://www.pokedata.ovh"
 WORLDS_2026_ID = "0000191"
+BALTIMORE_2027_ID = "0000192"  # first official Reg M-C Regional (19–20 Sep 2026)
+REG_MC_START = "2026-09-09"
 UA = "ChampionsVGCTeamRecs/0.4 (+personal teambuilding tool)"
+CACHE_DIR = Path(__file__).resolve().parent / "data" / "cache"
+WORLDS_SNAPSHOT = "worlds_2026_masters.json"
+USAGE_SNAPSHOT = "pika_usage_regmc.json"
+LIMITLESS_SNAPSHOT = "limitless_regmc.json"
+OFFICIAL_SEASON_SNAPSHOT = "official_season_2026.json"
+OFFICIAL_MC_SNAPSHOT = "official_mc_2027.json"
 
 # Members below this many weighted teams are "off-meta" for voting.
 SUPPORT_FLOOR = 25.0
@@ -62,10 +73,108 @@ def _share(counter: dict[str, float]) -> dict[str, float]:
     return {k: v / total for k, v in counter.items()}
 
 
-def _http_json(url: str) -> object:
+def _http_json(url: str, *, timeout: int = 60) -> object:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
+
+
+def _cache_path(name: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / name
+
+
+def snapshot_corpus(corpus: TeamCorpus, name: str, *, source: str) -> None:
+    """Persist a normalized Bring-6 snapshot that survives upstream schema breaks."""
+    payload = {
+        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": source,
+        "n_teams": len(corpus.teams),
+        "teams": [
+            {
+                "team_id": team.team_id,
+                "source": team.source,
+                "weight": team.weight,
+                "wins": team.wins,
+                "losses": team.losses,
+                "members": [
+                    {
+                        "species": m.species,
+                        "moves": list(m.moves),
+                        "item": m.item,
+                        "ability": m.ability,
+                        "tera": m.tera,
+                        "nature": m.nature,
+                        "evs": m.evs,
+                    }
+                    for m in team.members
+                ],
+            }
+            for team in corpus.teams
+        ],
+    }
+    path = _cache_path(name)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def load_snapshot(name: str) -> TeamCorpus | None:
+    path = _cache_path(name)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    corpus = TeamCorpus()
+    for raw in payload.get("teams") or []:
+        members = []
+        for slot in raw.get("members") or []:
+            species = slot.get("species")
+            if not species:
+                continue
+            members.append(
+                PokemonSet(
+                    species=str(species),
+                    moves=list(slot.get("moves") or []),
+                    item=slot.get("item"),
+                    ability=slot.get("ability"),
+                    tera=slot.get("tera"),
+                    nature=slot.get("nature"),
+                    evs=slot.get("evs"),
+                )
+            )
+        if len(members) < 2:
+            continue
+        corpus.add(
+            Team(
+                members=members,
+                team_id=str(raw.get("team_id") or ""),
+                source=str(raw.get("source") or payload.get("source") or "snapshot"),
+                weight=float(raw.get("weight") or 1.0),
+                wins=float(raw.get("wins") or 0.0),
+                losses=float(raw.get("losses") or 0.0),
+            )
+        )
+    return corpus if corpus.teams else None
+
+
+def _load_or_snapshot(
+    label: str,
+    loader: Callable[[], TeamCorpus],
+    snapshot: str | None = None,
+) -> TeamCorpus:
+    """Run a live loader; on success refresh the snapshot. On failure use cache."""
+    try:
+        bag = loader()
+        if snapshot and bag and bag.teams:
+            try:
+                snapshot_corpus(bag, snapshot, source=label)
+            except OSError:
+                pass
+        return bag
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        cached = load_snapshot(snapshot) if snapshot else None
+        return cached if cached is not None else TeamCorpus()
 
 
 def _pct(value) -> float:
@@ -718,7 +827,11 @@ SlotProfile._copy_as_fallback = _copy_as_fallback  # type: ignore[attr-defined]
 # ---------------------------------------------------------------------------
 
 def load_team_usage(fmt: str = FORMAT_TOURS) -> TeamCorpus:
-    payload = _http_json(f"{PIKA}/api/team-usage/{fmt}")
+    try:
+        payload = _http_json(f"{PIKA}/api/team-usage/{fmt}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        cached = load_snapshot(USAGE_SNAPSHOT) if fmt == FORMAT_RANKED else None
+        return cached if cached is not None else TeamCorpus()
     corpus = TeamCorpus()
     for group in payload.get("groups") or []:
         pokemon = group.get("pokemon") or []
@@ -745,6 +858,11 @@ def load_team_usage(fmt: str = FORMAT_TOURS) -> TeamCorpus:
                 losses=losses,
             )
         )
+    if fmt == FORMAT_RANKED and corpus.teams:
+        try:
+            snapshot_corpus(corpus, USAGE_SNAPSHOT, source=f"pikalytics-team-usage:{fmt}")
+        except OSError:
+            pass
     return corpus
 
 
@@ -778,7 +896,10 @@ def _team_from_pika_paste(raw: dict, source: str) -> Team | None:
 
 
 def load_sample_pastes(fmt: str = FORMAT_TOURS) -> TeamCorpus:
-    payload = _http_json(f"{PIKA}/api/topteams/{fmt}")
+    try:
+        payload = _http_json(f"{PIKA}/api/topteams/{fmt}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return TeamCorpus()
     corpus = TeamCorpus()
     seen = set()
     for raw in payload.get("landingTeams") or []:
@@ -968,6 +1089,158 @@ def _merge_detail(*blobs: dict | None) -> dict:
     return merged
 
 
+_TERRAIN_SEEDS = {
+    "grassy seed": "grassy",
+    "psychic seed": "psychic",
+    "electric seed": "electric",
+    "misty seed": "misty",
+}
+_SURGES = {
+    "grassy surge": "grassy",
+    "psychic surge": "psychic",
+    "electric surge": "electric",
+    "misty surge": "misty",
+}
+_CONSUMABLE_ITEMS = {
+    "white herb",
+    "mental herb",
+    "power herb",
+    "mirror herb",
+    "room service",
+    "adrenaline orb",
+    "luminous moss",
+    "cell battery",
+    "snowball",
+    "absorb bulb",
+}
+_ILLEGAL_MOVES = {
+    "indeedee": {"follow me"},
+}
+_TERRAIN_TO_SEED = {
+    "grassy": "Grassy Seed",
+    "psychic": "Psychic Seed",
+    "electric": "Electric Seed",
+    "misty": "Misty Seed",
+}
+_SAFE_ITEMS = (
+    "Focus Sash",
+    "Covert Cloak",
+    "Safety Goggles",
+    "Life Orb",
+    "Leftovers",
+    "Choice Scarf",
+    "Choice Specs",
+    "Choice Band",
+    "Sitrus Berry",
+)
+
+
+def _team_terrain(slots: list[BuiltSlot]) -> str | None:
+    for slot in slots:
+        terrain = _SURGES.get(_norm(slot.ability or ""))
+        if terrain:
+            return terrain
+    return None
+
+
+def _is_consumable_item(item: str | None) -> bool:
+    if not item:
+        return False
+    k = _norm(item)
+    if k.endswith(" berry") or k.endswith(" seed"):
+        return True
+    return k in _CONSUMABLE_ITEMS
+
+
+def _team_abilities(slots: list[BuiltSlot]) -> set[str]:
+    return {_norm(s.ability or "") for s in slots if s.ability}
+
+
+def _item_allowed(
+    item: str | None,
+    *,
+    terrain: str | None,
+    trick: bool,
+    abilities: set[str] | None = None,
+) -> bool:
+    if not item:
+        return True
+    k = _norm(item)
+    seed_terrain = _TERRAIN_SEEDS.get(k)
+    if seed_terrain and terrain and seed_terrain != terrain:
+        return False
+    if trick and _is_consumable_item(item):
+        return False
+    abilities = abilities or set()
+    if k == "white herb" and "intimidate" not in abilities:
+        return False
+    return True
+
+
+def _legal_moves(species: str, moves: list[str]) -> list[str]:
+    blocked = _ILLEGAL_MOVES.get(_norm(species), set())
+    if not blocked:
+        return moves
+    return [mv for mv in moves if _norm(mv) not in blocked]
+
+
+def _apply_set_legality(slots: list[BuiltSlot]) -> None:
+    """Drop illegal move/item combos that usage slices still emit."""
+    terrain = _team_terrain(slots)
+    abilities = _team_abilities(slots)
+    used = {_norm(s.item) for s in slots if s.item}
+
+    for slot in slots:
+        before = list(slot.moves)
+        slot.moves = _legal_moves(slot.species, slot.moves)
+        if before != slot.moves:
+            dropped = [m for m in before if m not in slot.moves]
+            slot.notes.append("dropped illegal move: " + ", ".join(dropped))
+
+        trick = any(_norm(m) in ("trick", "switcheroo") for m in slot.moves)
+
+        filtered = [
+            (n, s)
+            for n, s in slot.item_choices
+            if _item_allowed(n, terrain=terrain, trick=trick, abilities=abilities)
+        ]
+        if terrain and _TERRAIN_TO_SEED.get(terrain):
+            seed = _TERRAIN_TO_SEED[terrain]
+            if not any(_norm(n) == _norm(seed) for n, _ in filtered):
+                filtered = [(seed, 0.4)] + filtered
+        slot.item_choices = filtered
+        if _item_allowed(slot.item, terrain=terrain, trick=trick, abilities=abilities):
+            continue
+
+        pick = None
+        for name, _share in filtered:
+            if name and _norm(name) not in used:
+                pick = name
+                break
+        if pick is None:
+            for name in _SAFE_ITEMS:
+                if (
+                    _item_allowed(name, terrain=terrain, trick=trick, abilities=abilities)
+                    and _norm(name) not in used
+                ):
+                    pick = name
+                    break
+        old = slot.item
+        slot.item = pick
+        if pick:
+            used.add(_norm(pick))
+        reason = []
+        if old and _TERRAIN_SEEDS.get(_norm(old)) and terrain:
+            reason.append(f"{old} needs { _TERRAIN_SEEDS[_norm(old)] } terrain, team is {terrain}")
+        if trick and _is_consumable_item(old):
+            reason.append(f"Trick cannot hold a consumable ({old})")
+        slot.notes.append(
+            f"{old} → {pick} (" + "; ".join(reason or ["set legality"]) + ")"
+        )
+        if old and _norm(old) in used:
+            used.discard(_norm(old))
+
+
 def fill_slot(
     corpus: TeamCorpus,
     species: str,
@@ -1006,7 +1279,7 @@ def fill_slot(
         if mates:
             pair_moves = pastes.profile(name, mates[:1], fallback=False)
         use = pair_moves if pair_moves and pair_moves.n_teams >= 8 else move_prof
-        moves = [mv for mv, _ in use.top_moves(4)]
+        moves = _legal_moves(name, [mv for mv, _ in use.top_moves(8)])[:4]
         if moves:
             notes.append(f"moves from {use.n_teams:.0f} pastes")
 
@@ -1046,6 +1319,12 @@ def fill_slot(
                 break
         moves = kept[:4]
         notes.append("locked move: " + ", ".join(forced))
+
+    legal = _legal_moves(name, moves)
+    if legal != moves:
+        dropped = [m for m in moves if m not in legal]
+        notes.append("dropped illegal move: " + ", ".join(dropped))
+        moves = legal
 
     if not nature or not spread:
         inf_nat, inf_sp = _infer_alignment(moves)
@@ -1347,8 +1626,9 @@ def build_team(
         )
     _apply_mega_cap(corpus, slots, seed_count=seed_count, max_megas=cap)
     _assign_unique_items(slots)
-    # Unique-item pass can hand a stone back; enforce the cap again.
     _apply_mega_cap(corpus, slots, seed_count=seed_count, max_megas=cap)
+    _apply_set_legality(slots)
+    _assign_unique_items(slots)
     return BuiltTeam(slots=slots, resolved=resolved)
 
 
@@ -1533,6 +1813,21 @@ def _pokedata_species(name: str, item: str | None = None) -> str:
     return species
 
 
+def _is_reg_mc_event(label: str) -> bool:
+    """Keep Limitless cups that are explicitly Regulation M-C / Champions M-C."""
+    text = label or ""
+    if re.search(r"reg(?:ulation)?\s*m-?[ab]\b|\bm-[ab]\b", text, re.I):
+        if not re.search(r"reg(?:ulation)?\s*m-?c\b|\bm-c\b", text, re.I):
+            return False
+    return bool(
+        re.search(
+            r"reg(?:ulation)?\s*m-?c\b|\bm-c\b|champions?\s+reg(?:ulation)?\s*m-?c",
+            text,
+            re.I,
+        )
+    )
+
+
 def _event_kind(name: str) -> str:
     k = _norm(name)
     if "world" in k:
@@ -1572,7 +1867,10 @@ def _event_weight(kind: str, placing: int | None, wins: int, players: int = 0) -
 
 def list_official_events(year: int | None = 2026, *, min_decklists: int = 1) -> list[dict]:
     """Play! Pokemon VG events from pokedata.ovh (Worlds, ICs, Regionals)."""
-    payload = _http_json(f"{POKEDATA}/apiv2/vg/tournaments")
+    try:
+        payload = _http_json(f"{POKEDATA}/apiv2/vg/tournaments")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return []
     rows = ((payload.get("vg") or {}).get("data")) or payload.get("data") or []
     out = []
     for row in rows:
@@ -1661,7 +1959,10 @@ def load_official_event(
     """One official event. Worlds 2026 is `WORLDS_2026_ID` ('0000191')."""
     eid = str(event_id).zfill(7) if str(event_id).isdigit() else str(event_id)
     div_path = "+".join(divisions)
-    payload = _http_json(f"{POKEDATA}/apiv2/division/{div_path}/id/{eid}/vg")
+    try:
+        payload = _http_json(f"{POKEDATA}/apiv2/division/{div_path}/id/{eid}/vg")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, TypeError):
+        return TeamCorpus()
     meta = payload.get("tournament") or {}
     event_name = meta.get("name") or eid
     kind = _event_kind(event_name)
@@ -1687,13 +1988,78 @@ def load_official_event(
 
 
 def load_worlds(year: int = 2026, *, divisions: tuple[str, ...] = ("masters",)) -> TeamCorpus:
-    if year == 2026:
-        return load_official_event(WORLDS_2026_ID, divisions=divisions)
-    events = list_official_events(year, min_decklists=1)
-    worlds = [e for e in events if e["kind"] == "worlds"]
-    if not worlds:
-        raise ValueError(f"no Worlds event found for {year} on pokedata.ovh")
-    return load_official_event(worlds[0]["id"], divisions=divisions)
+    def _live() -> TeamCorpus:
+        if year == 2026:
+            return load_official_event(WORLDS_2026_ID, divisions=divisions)
+        events = list_official_events(year, min_decklists=1)
+        worlds = [e for e in events if e["kind"] == "worlds"]
+        if not worlds:
+            return TeamCorpus()
+        return load_official_event(worlds[0]["id"], divisions=divisions)
+
+    bag = _live()
+    snap_name = WORLDS_SNAPSHOT if year == 2026 else f"worlds_{year}_masters.json"
+    if bag.teams:
+        try:
+            snapshot_corpus(bag, snap_name, source=f"pokedata:worlds:{year}")
+        except OSError:
+            pass
+        return bag
+    cached = load_snapshot(snap_name)
+    return cached if cached is not None else TeamCorpus()
+
+
+def load_official_mc_events(
+    *,
+    min_decklists: int = 40,
+    divisions: tuple[str, ...] = ("masters",),
+) -> TeamCorpus:
+    """Official Play! events on Regulation M-C (2027 circuit onward).
+
+    Worlds 2026 is M-B and is loaded separately at reduced weight.
+    Baltimore 2027 (`0000192`) is the first M-C Regional and is included here
+    at full official weight.
+    """
+    seen: set[str] = set()
+    picked: list[dict] = []
+    for year in (2026, 2027):
+        for ev in list_official_events(year, min_decklists=min_decklists):
+            eid = str(ev.get("id") or "").zfill(7)
+            if not eid or eid in seen or eid == WORLDS_2026_ID:
+                continue
+            start = str(ev.get("start") or "")
+            if start and start < REG_MC_START:
+                continue
+            if ev.get("kind") not in ("worlds", "international", "special", "regional"):
+                continue
+            seen.add(eid)
+            picked.append(ev)
+    if BALTIMORE_2027_ID not in seen:
+        picked.insert(
+            0,
+            {
+                "id": BALTIMORE_2027_ID,
+                "name": "2027 Baltimore Pokémon VGC Regional Championships",
+                "kind": "regional",
+                "start": "2026-09-18",
+            },
+        )
+
+    corpus = TeamCorpus()
+    for ev in picked:
+        try:
+            bag = load_official_event(str(ev["id"]), divisions=divisions)
+        except Exception:
+            continue
+        corpus.extend(bag.teams)
+    if corpus.teams:
+        try:
+            snapshot_corpus(corpus, OFFICIAL_MC_SNAPSHOT, source="pokedata:official-mc")
+        except OSError:
+            pass
+        return corpus
+    cached = load_snapshot(OFFICIAL_MC_SNAPSHOT)
+    return cached if cached is not None else corpus
 
 
 def load_official_season(
@@ -1718,14 +2084,24 @@ def load_official_season(
             corpus.extend(load_official_event(ev["id"], divisions=divisions).teams)
         except Exception:
             continue
-    return corpus
+    if corpus.teams:
+        try:
+            snapshot_corpus(corpus, OFFICIAL_SEASON_SNAPSHOT, source="pokedata:season:2026")
+        except OSError:
+            pass
+        return corpus
+    cached = load_snapshot(OFFICIAL_SEASON_SNAPSHOT)
+    return cached if cached is not None else corpus
 
 
 def list_limitless_events(*, page: int = 1, pages: int = 1) -> list[dict]:
     """Pikalytics feed of Limitless VGC cups (not official Play! events)."""
     out: list[dict] = []
     for p in range(page, page + pages):
-        payload = _http_json(f"{PIKA}/api/tournaments?page={p}")
+        try:
+            payload = _http_json(f"{PIKA}/api/tournaments?page={p}")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            break
         out.extend(payload.get("tournaments") or [])
         pag = payload.get("pagination") or {}
         if not pag.get("hasNext"):
@@ -1734,7 +2110,10 @@ def list_limitless_events(*, page: int = 1, pages: int = 1) -> list[dict]:
 
 
 def load_limitless_event(slug: str) -> TeamCorpus:
-    payload = _http_json(f"{PIKA}/api/tournaments/limitless/{slug}")
+    try:
+        payload = _http_json(f"{PIKA}/api/tournaments/limitless/{slug}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return TeamCorpus()
     meta = payload.get("tournament") or {}
     name = meta.get("name") or slug
     players = int(meta.get("playerCount") or 0)
@@ -1773,9 +2152,7 @@ def load_recent_limitless(
         if int(ev.get("playerCount") or 0) < min_players:
             continue
         label = f"{ev.get('name') or ''} {ev.get('label') or ''} {ev.get('slug') or ''}"
-        if champions_only and not re.search(
-            r"champion|reg\s*m-?[abc]|m-[abc]\b|vgc", label, re.I
-        ):
+        if champions_only and not _is_reg_mc_event(label):
             continue
         slug = ev.get("slug")
         if not slug:
@@ -1787,7 +2164,14 @@ def load_recent_limitless(
         taken += 1
         if taken >= max_events:
             break
-    return corpus
+    if corpus.teams:
+        try:
+            snapshot_corpus(corpus, LIMITLESS_SNAPSHOT, source="pikalytics:limitless:regmc")
+        except OSError:
+            pass
+        return corpus
+    cached = load_snapshot(LIMITLESS_SNAPSHOT)
+    return cached if cached is not None else corpus
 
 
 def _team_sig(team: Team) -> tuple[str, ...]:
@@ -1831,14 +2215,22 @@ def load_teambuilder_data(
     *,
     include_worlds: bool = True,
     include_official_season: bool = False,
-    include_limitless: bool = False,
+    include_official_mc: bool = True,
+    include_limitless: bool = True,
     include_usage: bool = True,
     include_sample_pastes: bool = True,
 ) -> tuple[TeamCorpus, TeamCorpus]:
     """Composition corpus + paste corpus for `build_team` / `advise_core`.
 
-    Official Worlds lists are full 6-mon pastes (item, ability, alignment, moves),
-    so they feed both teammate recommendations and set fills.
+    Default path (Reg M-C):
+      - Pikalytics team-usage + sample pastes (live format)
+      - Limitless cups whose titles say Reg M-C
+      - Official Reg M-C Play! events (Baltimore 2027 Regional and later)
+      - Worlds 2026 snapshot, downweighted 0.35 (M-B lists, useful pastes)
+      - Pre-M-C 2026 ICs/Regionals OFF
+
+    Each live loader writes a normalized snapshot under data/cache/.
+    A schema break or timeout falls back to that snapshot so the UI stays up.
     """
     bags: list[TeamCorpus] = []
     pastes = TeamCorpus()
@@ -1857,6 +2249,10 @@ def load_teambuilder_data(
             team.weight *= 0.35
         bags.append(worlds)
         pastes.extend(worlds.teams)
+    if include_official_mc:
+        official_mc = load_official_mc_events()
+        bags.append(official_mc)
+        pastes.extend(official_mc.teams)
     if include_official_season:
         season = load_official_season(2026)
         bags.append(season)

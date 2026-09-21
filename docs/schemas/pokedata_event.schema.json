@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pokedata_event.schema.json",
+  "title": "pokedata.ovh official VG event",
+  "description": "GET https://www.pokedata.ovh/apiv2/division/{divisions}/id/{eventId}/vg. Worlds 2026 Masters is id 0000191.",
+  "type": "object",
+  "properties": {
+    "tournament": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "number"] },
+        "name": { "type": "string" },
+        "players": { "type": "object" }
+      }
+    },
+    "tournament_data": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "division": { "type": "string" },
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "placing": { "type": ["integer", "string", "null"] },
+                "record": {
+                  "type": "object",
+                  "properties": {
+                    "wins": { "type": "integer" },
+                    "losses": { "type": "integer" }
+                  }
+                },
+                "decklist": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                      "name": { "type": "string" },
+                      "item": { "type": ["string", "null"] },
+                      "ability": { "type": ["string", "null"] },
+                      "stat_alignment": { "type": ["string", "null"] },
+                      "nature": { "type": ["string", "null"] },
+                      "moves": { "type": "array" },
+                      "badges": { "type": "array" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

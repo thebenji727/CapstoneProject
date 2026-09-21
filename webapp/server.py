@@ -167,6 +167,7 @@ def _load() -> None:
         corpus, pastes = recs.load_teambuilder_data(
             include_worlds=True,
             include_official_season=False,
+            include_official_mc=True,
             include_limitless=True,
             include_usage=True,
             include_sample_pastes=True,
