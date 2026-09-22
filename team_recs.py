@@ -23,6 +23,7 @@ import re
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,7 @@ OFFICIAL_SEASON_SNAPSHOT = "official_season_2026.json"
 OFFICIAL_MC_SNAPSHOT = "official_mc_2027.json"
 
 # Members below this many weighted teams are "off-meta" for voting.
+CACHE_MAX_AGE_HOURS = 12.0
 SUPPORT_FLOOR = 25.0
 # Dampen lift from 1-team coincidences: n / (n + this).
 LIFT_PRIOR = 8.0
@@ -156,6 +158,21 @@ def load_snapshot(name: str) -> TeamCorpus | None:
             )
         )
     return corpus if corpus.teams else None
+
+
+def snapshot_age_hours(name: str) -> float | None:
+    path = _cache_path(name)
+    if not path.is_file():
+        return None
+    age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+    return max(0.0, age / 3600.0)
+
+
+def load_fresh_snapshot(name: str, *, max_age_hours: float = CACHE_MAX_AGE_HOURS) -> TeamCorpus | None:
+    age = snapshot_age_hours(name)
+    if age is None or age > max_age_hours:
+        return None
+    return load_snapshot(name)
 
 
 def _load_or_snapshot(
@@ -827,8 +844,12 @@ SlotProfile._copy_as_fallback = _copy_as_fallback  # type: ignore[attr-defined]
 # ---------------------------------------------------------------------------
 
 def load_team_usage(fmt: str = FORMAT_TOURS) -> TeamCorpus:
+    if fmt == FORMAT_RANKED:
+        cached = load_fresh_snapshot(USAGE_SNAPSHOT)
+        if cached is not None:
+            return cached
     try:
-        payload = _http_json(f"{PIKA}/api/team-usage/{fmt}")
+        payload = _http_json(f"{PIKA}/api/team-usage/{fmt}", timeout=25)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         cached = load_snapshot(USAGE_SNAPSHOT) if fmt == FORMAT_RANKED else None
         return cached if cached is not None else TeamCorpus()
@@ -1396,32 +1417,50 @@ def _detail_from_official(name: str) -> dict | None:
     }
 
 
-def load_details(names: Iterable[str]) -> dict[str, dict]:
-    """Ranked page first; fill holes from tournament pages and the base forme."""
-    out: dict[str, dict] = {}
-    for name in names:
-        ranked = _safe_detail(name, FORMAT_RANKED)
+def _detail_for_one(name: str) -> dict:
+    ranked = _safe_detail(name, FORMAT_RANKED)
+    stripped = re.sub(r"-mega(?:-[xyz])?$", "", name, flags=re.I)
+    has_set = bool(ranked and ranked.get("moves") and (ranked.get("spreads") or ranked.get("natures")))
+    tours = prev = base = None
+    if not has_set:
         tours = _safe_detail(name, FORMAT_TOURS)
         prev = _safe_detail(name, FORMAT_RANKED_PREV)
-        stripped = re.sub(r"-mega(?:-[xyz])?$", "", name, flags=re.I)
-        base = None
-        if _is_mega_name(name) or (ranked and not (ranked.get("moves") and ranked.get("spreads"))):
-            if stripped != name:
-                base = _safe_detail(stripped, FORMAT_RANKED)
-        merged = _merge_detail(
-            ranked,
-            tours,
-            prev,
-            base,
-            _detail_from_official(name),
-            _detail_from_official(stripped if stripped != name else name),
-        )
-        if not merged:
+        if stripped != name:
+            base = _safe_detail(stripped, FORMAT_RANKED)
+    official = _detail_from_official(name)
+    official_base = (
+        _detail_from_official(stripped) if stripped != name else None
+    )
+    return _merge_detail(ranked, tours, prev, base, official, official_base)
+
+
+def load_details(names: Iterable[str]) -> dict[str, dict]:
+    """Ranked page first; fill holes from tournament pages and the base forme."""
+    wanted = []
+    seen = set()
+    for name in names:
+        if not name or _norm(name) in seen:
             continue
-        out[_norm(name)] = merged
-        disp = merged.get("name_trans") or merged.get("name")
-        if disp:
-            out[_norm(disp)] = merged
+        seen.add(_norm(name))
+        wanted.append(name)
+    out: dict[str, dict] = {}
+    if not wanted:
+        return out
+    workers = min(6, len(wanted))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_detail_for_one, name): name for name in wanted}
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                merged = fut.result()
+            except Exception:
+                merged = {}
+            if not merged:
+                continue
+            out[_norm(name)] = merged
+            disp = merged.get("name_trans") or merged.get("name")
+            if disp:
+                out[_norm(disp)] = merged
     return out
 
 
@@ -1988,6 +2027,11 @@ def load_official_event(
 
 
 def load_worlds(year: int = 2026, *, divisions: tuple[str, ...] = ("masters",)) -> TeamCorpus:
+    snap_name = WORLDS_SNAPSHOT if year == 2026 else f"worlds_{year}_masters.json"
+    cached = load_fresh_snapshot(snap_name, max_age_hours=24 * 14)
+    if cached is not None:
+        return cached
+
     def _live() -> TeamCorpus:
         if year == 2026:
             return load_official_event(WORLDS_2026_ID, divisions=divisions)
@@ -1998,7 +2042,6 @@ def load_worlds(year: int = 2026, *, divisions: tuple[str, ...] = ("masters",)) 
         return load_official_event(worlds[0]["id"], divisions=divisions)
 
     bag = _live()
-    snap_name = WORLDS_SNAPSHOT if year == 2026 else f"worlds_{year}_masters.json"
     if bag.teams:
         try:
             snapshot_corpus(bag, snap_name, source=f"pokedata:worlds:{year}")
@@ -2020,6 +2063,9 @@ def load_official_mc_events(
     Baltimore 2027 (`0000192`) is the first M-C Regional and is included here
     at full official weight.
     """
+    cached = load_fresh_snapshot(OFFICIAL_MC_SNAPSHOT)
+    if cached is not None:
+        return cached
     seen: set[str] = set()
     picked: list[dict] = []
     for year in (2026, 2027):
@@ -2139,11 +2185,14 @@ def load_limitless_event(slug: str) -> TeamCorpus:
 def load_recent_limitless(
     *,
     min_players: int = 16,
-    pages: int = 2,
-    max_events: int = 12,
+    pages: int = 1,
+    max_events: int = 6,
     champions_only: bool = True,
 ) -> TeamCorpus:
     """Finished Limitless cups large enough to matter for current Champions."""
+    cached = load_fresh_snapshot(LIMITLESS_SNAPSHOT)
+    if cached is not None:
+        return cached
     corpus = TeamCorpus()
     taken = 0
     for ev in list_limitless_events(pages=pages):
@@ -2234,33 +2283,35 @@ def load_teambuilder_data(
     """
     bags: list[TeamCorpus] = []
     pastes = TeamCorpus()
-    if include_usage:
-        bags.append(load_team_usage(FORMAT_RANKED))
-    if include_sample_pastes:
-        for fmt in (FORMAT_RANKED, FORMAT_TOURS):
-            sample = load_sample_pastes(fmt)
-            bags.append(sample)
-            pastes.extend(sample.teams)
-    if include_worlds:
-        worlds = load_worlds(2026)
-        # Worlds 2026 was Reg M-B. Keep the pastes for set fill, but do not
-        # let that older meta outvote current M-C pairing data.
-        for team in worlds.teams:
-            team.weight *= 0.35
-        bags.append(worlds)
-        pastes.extend(worlds.teams)
-    if include_official_mc:
-        official_mc = load_official_mc_events()
-        bags.append(official_mc)
-        pastes.extend(official_mc.teams)
-    if include_official_season:
-        season = load_official_season(2026)
-        bags.append(season)
-        pastes.extend(season.teams)
-    if include_limitless:
-        cups = load_recent_limitless()
-        bags.append(cups)
-        pastes.extend(cups.teams)
+    jobs: dict = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        if include_usage:
+            jobs[pool.submit(load_team_usage, FORMAT_RANKED)] = "usage"
+        if include_sample_pastes:
+            for fmt in (FORMAT_RANKED, FORMAT_TOURS):
+                jobs[pool.submit(load_sample_pastes, fmt)] = f"pastes:{fmt}"
+        if include_worlds:
+            jobs[pool.submit(load_worlds, 2026)] = "worlds"
+        if include_official_mc:
+            jobs[pool.submit(load_official_mc_events)] = "official_mc"
+        if include_official_season:
+            jobs[pool.submit(load_official_season, 2026)] = "official_season"
+        if include_limitless:
+            jobs[pool.submit(load_recent_limitless)] = "limitless"
+        for fut in as_completed(jobs):
+            label = jobs[fut]
+            try:
+                bag = fut.result()
+            except Exception:
+                bag = TeamCorpus()
+            if bag is None:
+                bag = TeamCorpus()
+            if label == "worlds":
+                for team in bag.teams:
+                    team.weight *= 0.35
+            bags.append(bag)
+            if label != "usage":
+                pastes.extend(bag.teams)
     paste_best: dict[tuple[str, ...], Team] = {}
     for team in pastes.teams:
         sig = _team_sig(team)
