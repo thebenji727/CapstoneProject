@@ -45,6 +45,29 @@ h1 {
   margin: 0 0 8px;
 }
 
+.roster-box { margin: 18px 0 8px; text-align: left; }
+.icon-grid { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.icon-label { width: 88px; text-align: center; }
+.icon-label img { width: 64px; height: 64px; object-fit: contain; background: #efeaff; border-radius: 8px; }
+.icon-label input { width: 100%; margin-top: 4px; font: inherit; }
+.drop {
+  border: 1px dashed #888;
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+  color: #444;
+  background: #fafafa;
+  cursor: pointer;
+}
+.drop.over { background: #eef6ff; border-color: #3b6ea5; }
+#rosterText {
+  width: 100%;
+  margin: 8px 0;
+  font: inherit;
+  padding: 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
 .seed-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -335,6 +358,16 @@ button.partner {
   line-height: 1.25;
 }
 
+#rosterList .chip,
+#rosterList .name,
+#rosterList .meta {
+  color: #111;
+}
+#rosterList .name {
+  font-size: 16px;
+  font-weight: 700;
+}
+
 .meta, .notes {
   font-size: 12px;
   color: var(--muted);
@@ -411,6 +444,12 @@ section { margin-top: 22px; }
   .team-split {
     grid-template-columns: 1fr;
   }
+}
+
+#rosterList button,
+#rosterList button .name,
+#rosterList button .meta {
+  color: #111 !important;
 }
 
 @media (max-width: 760px) {

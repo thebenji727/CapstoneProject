@@ -715,6 +715,7 @@ class TeamCorpus:
         *,
         top_n: int = 10,
         min_together: float = 0.03,
+        roster: Iterable[str] | None = None,
     ) -> list[dict]:
         """Next pick given a partial team.
 
@@ -736,6 +737,7 @@ class TeamCorpus:
 
         blocked = {_norm(n) for n in names}
         blocked_families = {_species_clause_key(n) for n in names}
+        owned = _roster_keys(self, roster)
         scores: dict[str, dict] = {}
         voter_weight = {n: math.log1p(self.support(n)) for n in names}
 
@@ -748,6 +750,8 @@ class TeamCorpus:
             for rec in recs:
                 poke = rec["pokemon"]
                 if _norm(poke) in blocked or _species_clause_key(poke) in blocked_families:
+                    continue
+                if owned and not _owned(poke, owned):
                     continue
                 bucket = scores.setdefault(
                     poke,
@@ -1595,6 +1599,30 @@ def _apply_mega_cap(
         _swap_off_megastone(corpus, slots[idx], teammates)
 
 
+def _roster_keys(corpus: TeamCorpus, roster: Iterable[str] | None) -> set[str]:
+    keys: set[str] = set()
+    for raw in roster or ():
+        name = " ".join(str(raw).split())
+        if not name:
+            continue
+        resolved = corpus.resolve(name)
+        canon = resolved.canonical or name
+        keys.add(_norm(canon))
+        keys.add(_family_key(canon))
+        keys.add(_species_clause_key(canon))
+        keys.add(_norm(_base_forme(canon)))
+    return keys
+
+
+def _owned(name: str, keys: set[str]) -> bool:
+    if not keys:
+        return True
+    return bool(
+        {_norm(name), _family_key(name), _species_clause_key(name), _norm(_base_forme(name))}
+        & keys
+    )
+
+
 def build_team(
     corpus: TeamCorpus,
     seeds: Iterable[str],
@@ -1604,6 +1632,7 @@ def build_team(
     one_mega: bool | None = None,
     max_megas: int | None = None,
     locked_moves: dict[str, Iterable[str]] | None = None,
+    roster: Iterable[str] | None = None,
 ) -> BuiltTeam:
     """Grow a partial core into a full Champions Bring-6 team.
 
@@ -1627,7 +1656,7 @@ def build_team(
     seed_count = len(names)
 
     while len(names) < size:
-        recs = corpus.recommend_for_team(names, top_n=20)
+        recs = corpus.recommend_for_team(names, top_n=40, roster=roster)
         picked = None
         mega_count = _count_megas(corpus, names)
         for rec in recs:

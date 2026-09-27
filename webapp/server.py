@@ -11,13 +11,18 @@ artifacts/team_recs.py. No extra Python packages required.
 
 from __future__ import annotations
 
+import base64
+import datetime
 import inspect
+import time
+import io
 import json
 import re
 import sys
 import threading
 import traceback
 import urllib.request
+from difflib import SequenceMatcher
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -162,8 +167,27 @@ def _pct(value) -> str | None:
     return f"{value:.1%}"
 
 
-def _load() -> None:
+REFRESH_SECONDS = 6 * 60 * 60
+STALE_SNAPSHOTS = (
+    "pika_usage_regmc.json",
+    "limitless_regmc.json",
+    "official_mc_2027.json",
+)
+
+
+def _drop_stale_snapshots() -> None:
+    """Force the next load to pull usage, cups, and new official events."""
+    cache = Path(__file__).resolve().parent.parent / "data" / "cache"
+    for name in STALE_SNAPSHOTS:
+        path = cache / name
+        if path.is_file():
+            path.unlink()
+
+
+def _load(*, refresh: bool = False) -> None:
     try:
+        if refresh:
+            _drop_stale_snapshots()
         corpus, pastes = recs.load_teambuilder_data(
             include_worlds=True,
             include_official_season=False,
@@ -183,11 +207,19 @@ def _load() -> None:
                 names=names,
                 teams=len(corpus),
                 weight=corpus.total_weight,
+                updated=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             )
     except Exception as exc:
         with LOCK:
             STATE["ready"] = False
             STATE["error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _refresh_loop() -> None:
+    _load(refresh=False)
+    while True:
+        time.sleep(REFRESH_SECONDS)
+        _load(refresh=True)
 
 
 def _explain(resolved, partners, sets, team, max_megas: int) -> dict:
@@ -288,18 +320,201 @@ def _explain(resolved, partners, sets, team, max_megas: int) -> dict:
     return {"summary": summary, "points": points}
 
 
-def _build_team(corpus, canonical, pastes, max_megas: int, locked_moves=None):
+_UNBURDEN_SPECIES = {"sneasler", "hawlucha", "slurpuff"}
+_UNBURDEN_ITEMS = {
+    "white herb",
+    "power herb",
+    "mental herb",
+    "mirror herb",
+    "focus sash",
+    "air balloon",
+    "weakness policy",
+}
+
+
+def _prefer_unburden(slot) -> None:
+    """A consumed item does nothing for Poison Touch. Unburden is the point."""
+    species = (slot.species or "").casefold().replace(" ", "").split("-")[0]
+    if species not in _UNBURDEN_SPECIES:
+        return
+    item = (slot.item or "").casefold()
+    consumed = item.endswith(" seed") or item.endswith(" berry") or item in _UNBURDEN_ITEMS
+    if not consumed or (slot.ability or "").casefold() == "unburden":
+        return
+    old = slot.ability or "no ability"
+    slot.ability = "Unburden"
+    note = f"{old} → Unburden ({slot.item} is consumed)"
+    if note not in slot.notes:
+        slot.notes.append(note)
+
+
+def _build_team(corpus, canonical, pastes, max_megas: int, locked_moves=None, roster=None):
     """Call build_team with max_megas when present, else the old one_mega flag."""
     params = inspect.signature(recs.build_team).parameters
     kwargs = {"pastes": pastes}
     if "max_megas" in params:
         kwargs["max_megas"] = max_megas
     elif "one_mega" in params:
-        # Old team_recs.py: 1 → enforce one stone, 2/any → do not cap.
         kwargs["one_mega"] = max_megas == 1
     if locked_moves and "locked_moves" in params:
         kwargs["locked_moves"] = locked_moves
+    if roster and "roster" in params:
+        kwargs["roster"] = roster
     return recs.build_team(corpus, canonical, **kwargs)
+
+
+def _match_roster_text(text: str, names: list[str]) -> list[str]:
+    cleaned = re.sub(r"[^A-Za-z0-9 \-\n]", " ", text or "")
+    tokens = [t for t in re.split(r"[\s,;/|]+", cleaned) if len(t) >= 4]
+    lines = [" ".join(line.split()) for line in cleaned.splitlines() if line.strip()]
+    candidates = lines + tokens
+    # Two-word windows catch "Indeedee F" and "Mega Garchomp".
+    words = cleaned.split()
+    candidates += [" ".join(words[i : i + 2]) for i in range(len(words) - 1)]
+    found: list[str] = []
+    seen = set()
+    indexed = [(n, recs._norm(n)) for n in names]
+    for raw in candidates:
+        key = recs._norm(raw)
+        if len(key) < 4:
+            continue
+        best = None
+        best_score = 0.0
+        for display, norm in indexed:
+            if key == norm or key in norm or norm in key:
+                score = 1.0 if key == norm else 0.9
+            else:
+                if abs(len(key) - len(norm)) > 4:
+                    continue
+                score = SequenceMatcher(None, key, norm).ratio()
+            if score > best_score:
+                best, best_score = display, score
+        if best and best_score >= 0.84 and best.casefold() not in seen:
+            seen.add(best.casefold())
+            found.append(best)
+    return found
+
+
+def _decode_images(images: list):
+    from PIL import Image
+    out = []
+    for item in images[:8]:
+        raw = item.get("data") or item.get("image") if isinstance(item, dict) else item
+        raw = str(raw or "")
+        if "," in raw and raw.startswith("data:"):
+            raw = raw.split(",", 1)[1]
+        try:
+            blob = base64.b64decode(raw)
+            out.append(Image.open(io.BytesIO(blob)).convert("RGB"))
+        except Exception:
+            continue
+    return out
+
+
+def _extract_box_icons(img) -> list[dict]:
+    """Pull Champions box cells. Names are not printed on this screen."""
+    from PIL import Image
+    work = img.copy()
+    work.thumbnail((1100, 1100))
+    w, h = work.size
+    px = work.load()
+    mask = [[False] * w for _ in range(h)]
+    for y in range(h):
+        row = mask[y]
+        for x in range(w):
+            r, g, b = px[x, y]
+            if r > 214 and g > 214 and b > 220 and abs(r - g) < 22:
+                row[x] = True
+    seen = [[False] * w for _ in range(h)]
+    boxes = []
+    for y in range(0, h, 2):
+        for x in range(0, w, 2):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            minx = maxx = x
+            miny = maxy = y
+            n = 0
+            while stack:
+                cx, cy = stack.pop()
+                n += 1
+                minx, maxx = min(minx, cx), max(maxx, cx)
+                miny, maxy = min(miny, cy), max(maxy, cy)
+                for nx, ny in ((cx - 2, cy), (cx + 2, cy), (cx, cy - 2), (cx, cy + 2)):
+                    if 0 <= nx < w and 0 <= ny < h and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            bw, bh = maxx - minx + 1, maxy - miny + 1
+            if n > 220 and 0.7 <= bw / max(bh, 1) <= 1.4 and 34 < bw < 150:
+                boxes.append((minx, miny, maxx, maxy))
+    icons = []
+    for minx, miny, maxx, maxy in boxes:
+        cell = work.crop((minx, miny, maxx + 1, maxy + 1))
+        colors = list(cell.resize((24, 24)).getdata())
+        reds = sum(1 for r, g, b in colors if r > 190 and r > g + 70 and r > b + 70)
+        # Ban icon is a red circle-slash. Orange sprites stay under this count.
+        if reds > 80:
+            continue
+        variance = 0
+        avg = tuple(sum(c[i] for c in colors) / len(colors) for i in range(3))
+        variance = sum(sum((c[i] - avg[i]) ** 2 for i in range(3)) for c in colors) / len(colors)
+        if variance < 400:
+            continue
+        thumb = cell.resize((72, 72))
+        buf = io.BytesIO()
+        thumb.save(buf, format="PNG")
+        icons.append(
+            {
+                "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+            }
+        )
+        if len(icons) >= 48:
+            break
+    return icons
+
+
+def _scan_images(images: list, names: list[str]) -> tuple[list[str], str, list[dict]]:
+    pictures = _decode_images(images)
+    icons: list[dict] = []
+    for img in pictures:
+        icons.extend(_extract_box_icons(img))
+    texts = []
+    try:
+        import pytesseract
+        for img in pictures:
+            try:
+                texts.append(pytesseract.image_to_string(img))
+            except Exception:
+                texts.append("")
+    except ImportError:
+        pass
+    text = "\n".join(texts)
+    note = ""
+    matched = _match_roster_text(text, names)
+    if icons and not matched:
+        note = f"Found {len(icons)} box icons. This screen has no names, so label the sprites below. Red-slash locks were skipped."
+    elif not icons and not matched:
+        note = "No names or box icons found. Crop to the Champions box and try again, or paste names."
+    return matched, note or text[:400], icons[:48]
+
+
+def _roster_from(payload: dict) -> list[str]:
+    raw = payload.get("roster") or []
+    if isinstance(raw, str):
+        raw = [p.strip() for p in raw.replace(",", "\n").splitlines()]
+    out = []
+    seen = set()
+    for name in raw:
+        name = " ".join(str(name).split())
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
 
 
 def _seeds_from(payload: dict) -> list[str]:
@@ -320,6 +535,59 @@ def _seeds_from(payload: dict) -> list[str]:
     return out[:6]
 
 
+def _best_roster_core(corpus, roster: list[str], max_megas: int) -> list[str]:
+    """Search roster cores and keep the Bring-6 with the strongest format support."""
+    owned = []
+    seen = set()
+    for name in roster:
+        canon = corpus.resolve(name).canonical or name
+        fam = recs._species_clause_key(canon)
+        if fam in seen or corpus.support(canon) <= 0:
+            continue
+        seen.add(fam)
+        owned.append(canon)
+    owned.sort(key=lambda n: corpus.support(n), reverse=True)
+    owned = owned[:16]
+    if not owned:
+        return []
+
+    def grow(seed: str) -> tuple[float, list[str]]:
+        names = [seed]
+        families = {recs._species_clause_key(seed)}
+        while len(names) < 6:
+            pick = None
+            for row in corpus.recommend_for_team(names, top_n=16, roster=owned):
+                cand = row["pokemon"]
+                fam = recs._species_clause_key(cand)
+                if fam in families:
+                    continue
+                item = (corpus.top_item(cand) or (None, 0))[0]
+                if max_megas and recs._count_megas(corpus, names) >= max_megas and recs._is_mega_slot(cand, item):
+                    continue
+                pick = cand
+                break
+            if pick is None:
+                for cand in owned:
+                    fam = recs._species_clause_key(cand)
+                    if fam not in families:
+                        pick = cand
+                        break
+            if pick is None:
+                break
+            names.append(pick)
+            families.add(recs._species_clause_key(pick))
+        return sum(corpus.support(n) for n in names), names
+
+    best_score = -1.0
+    best: list[str] = []
+    for seed in owned[:8]:
+        score, names = grow(seed)
+        if score > best_score:
+            best_score = score
+            best = names
+    return best
+
+
 def _recommend(payload: dict) -> dict:
     with LOCK:
         if not STATE["ready"]:
@@ -328,6 +596,13 @@ def _recommend(payload: dict) -> dict:
         pastes = STATE["pastes"]
 
     seeds = _seeds_from(payload)
+    roster = _roster_from(payload)
+    if not seeds and roster:
+        if len(roster) < 2:
+            return {"ok": False, "error": "Label at least two owned Pokémon first."}
+        seeds = _best_roster_core(corpus, roster, int(payload.get("max_megas") or 2))
+        if not seeds:
+            return {"ok": False, "error": "None of the labeled names are in the current format data."}
     if not seeds:
         return {"ok": False, "error": "Pick at least one Pokémon."}
 
@@ -359,7 +634,8 @@ def _recommend(payload: dict) -> dict:
     canonical = [r["canonical"] for r in resolved if r["canonical"]]
 
     partners = []
-    for row in corpus.recommend_for_team(canonical, top_n=top_n):
+    roster = _roster_from(payload)
+    for row in corpus.recommend_for_team(canonical, top_n=top_n, roster=roster):
         partners.append(
             {
                 "pokemon": row["pokemon"],
@@ -412,9 +688,10 @@ def _recommend(payload: dict) -> dict:
         resolved_one = corpus.resolve(poke)
         if resolved_one.canonical:
             locked[recs._norm(resolved_one.canonical)] = [move]
-    built = _build_team(corpus, canonical, pastes, max_megas, locked_moves=locked)
+    built = _build_team(corpus, canonical, pastes, max_megas, locked_moves=locked, roster=roster)
     slots_out = []
     for slot in built.slots:
+        _prefer_unburden(slot)
         types = pokemon_types(slot.species)
         slots_out.append(
             {
@@ -495,6 +772,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "pokemon": len(STATE["names"]),
                         "format": recs.FORMAT_RANKED,
                         "format_label": "Regulation M-C",
+                        "updated": STATE.get("updated"),
                     },
                 )
             return
@@ -537,7 +815,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path != "/api/recommend":
+        if path not in ("/api/recommend", "/api/roster"):
             self._json(404, {"ok": False, "error": "not found"})
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -547,15 +825,40 @@ class Handler(SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json(400, {"ok": False, "error": "invalid JSON"})
             return
+        payload = payload if isinstance(payload, dict) else {}
+        if path == "/api/roster":
+            try:
+                with LOCK:
+                    names = list(STATE["names"])
+                matched, text, icons = _scan_images(payload.get("images") or [], names)
+                typed = _match_roster_text(str(payload.get("text") or ""), names)
+                merged = []
+                seen = set()
+                for name in matched + typed:
+                    if name.casefold() in seen:
+                        continue
+                    seen.add(name.casefold())
+                    merged.append(name)
+                self._json(200, {"ok": True, "roster": merged, "ocr": text[:1500], "count": len(merged), "icons": icons})
+            except ModuleNotFoundError as exc:
+                missing = getattr(exc, "name", str(exc))
+                self._json(200, {
+                    "ok": False,
+                    "error": f"Missing {missing}. In the server folder run: py -3 -m pip install pillow",
+                })
+            except Exception as exc:
+                traceback.print_exc()
+                self._json(200, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
         try:
-            self._json(200, _recommend(payload if isinstance(payload, dict) else {}))
+            self._json(200, _recommend(payload))
         except Exception as exc:
             traceback.print_exc()
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
 def main() -> None:
-    threading.Thread(target=_load, daemon=True).start()
+    threading.Thread(target=_refresh_loop, daemon=True).start()
     host, port = "127.0.0.1", 8765
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"Champions VGC teambuilder  →  http://{host}:{port}")

@@ -5,6 +5,8 @@ const slotArt = [$("slot1art"), $("slot2art"), $("slot3art"), $("slot4art"), $("
 const statusEl = $("status");
 const errorEl = $("error");
 const go = $("go");
+let roster = [];
+let shotFiles = [];
 
 function showError(msg) {
   errorEl.hidden = !msg;
@@ -144,7 +146,7 @@ async function waitForData() {
       const res = await fetch("/api/status");
       const data = await res.json();
       if (data.ready) {
-        statusEl.textContent = `${data.format_label || "Regulation M-C"} · ${data.teams} unique 6-mon teams · ${data.pokemon} Pokémon in corpus`;
+        statusEl.textContent = `${data.format_label || "Regulation M-C"} · ${data.teams} unique 6-mon teams · ${data.pokemon} Pokémon in corpus${data.updated ? " · meta " + data.updated : ""}`;
         go.disabled = false;
         const poke = await (await fetch("/api/pokemon")).json();
         $("dex").innerHTML = (poke.names || [])
@@ -224,6 +226,8 @@ $("builder").addEventListener("submit", async (ev) => {
         seeds,
         seed_moves: seedMovesFromForm(),
         max_megas: maxMegasFromForm(),
+        roster,
+        auto_roster: seeds.length === 0,
         top_n: 8,
       }),
     });
@@ -397,5 +401,175 @@ $("copy").addEventListener("click", async () => {
     showError("Could not copy — select the paste box instead.");
   }
 });
+
+function renderIconLabels(icons) {
+  let box = $("iconLabels");
+  if (!box) return;
+  if (!icons.length) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = icons
+    .map((icon, i) => `<label class="icon-label">
+      <img src="${icon.image}" alt="" />
+      <input list="dex" data-icon="${i}" placeholder="name" />
+    </label>`)
+    .join("");
+}
+
+function addLabeledIcons() {
+  const box = $("iconLabels");
+  if (!box) return;
+  const seen = new Set(roster.map((n) => n.toLowerCase()));
+  box.querySelectorAll("input").forEach((input) => {
+    const name = input.value.trim();
+    if (!name || seen.has(name.toLowerCase())) return;
+    seen.add(name.toLowerCase());
+    roster.push(name);
+  });
+  renderRoster();
+}
+
+function renderRoster() {
+  const box = $("rosterList");
+  if (!box) return;
+  box.innerHTML = roster
+    .map((name) => `<button type="button" class="chip" data-drop="${esc(name)}">
+      <div class="art-wrap">${imgTag(name, "poke", "sprite sm")}</div>
+      <div class="body"><div class="name">${esc(name)}</div><div class="meta">owned · click to remove</div></div>
+    </button>`)
+    .join("");
+  box.querySelectorAll("[data-drop]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      roster = roster.filter((n) => n !== btn.dataset.drop);
+      renderRoster();
+    });
+  });
+}
+
+async function fileToData(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function scanRoster() {
+  showError("");
+  const btn = $("scan");
+  if (btn) btn.disabled = true;
+  try {
+    const images = [];
+    for (const file of shotFiles) images.push(await fileToData(file));
+    const res = await fetch("/api/roster", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ images, text: ($("rosterText") && $("rosterText").value) || "" }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showError(data.error || "Scan failed.");
+      return;
+    }
+    const seen = new Set(roster.map((n) => n.toLowerCase()));
+    for (const name of data.roster || []) {
+      if (!seen.has(name.toLowerCase())) {
+        seen.add(name.toLowerCase());
+        roster.push(name);
+      }
+    }
+    renderRoster();
+    renderIconLabels(data.icons || []);
+    if (data.ocr) showError(data.ocr);
+    else if (!roster.length && !(data.icons || []).length) {
+      showError("No Pokémon names found. Crop to the box, or paste names.");
+    }
+  } catch (err) {
+    showError(String(err));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+const drop = $("drop");
+const shots = $("shots");
+if (drop && shots) {
+  drop.addEventListener("click", () => shots.click());
+  shots.addEventListener("change", () => {
+    shotFiles = Array.from(shots.files || []);
+    drop.textContent = shotFiles.length
+      ? shotFiles.map((f) => f.name).join(", ")
+      : "Drop screenshots here, or click to choose";
+  });
+  drop.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+    drop.classList.add("over");
+  });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    drop.classList.remove("over");
+    shotFiles = Array.from(ev.dataTransfer.files || []).filter((f) => f.type.startsWith("image/"));
+    drop.textContent = shotFiles.length
+      ? shotFiles.map((f) => f.name).join(", ")
+      : "Drop screenshots here, or click to choose";
+  });
+}
+if ($("scan")) $("scan").addEventListener("click", scanRoster);
+if ($("addLabeled")) $("addLabeled").addEventListener("click", addLabeledIcons);
+
+async function buildFromRoster() {
+  const inputs = Array.from(document.querySelectorAll("#iconLabels input"));
+  if (inputs.length && inputs.some((input) => !input.value.trim())) {
+    showError("Fill every sprite name, then build.");
+    return;
+  }
+  addLabeledIcons();
+  const typed = (($("rosterText") && $("rosterText").value) || "")
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const seen = new Set(roster.map((n) => n.toLowerCase()));
+  for (const name of typed) {
+    if (!seen.has(name.toLowerCase())) {
+      seen.add(name.toLowerCase());
+      roster.push(name);
+    }
+  }
+  renderRoster();
+  if (roster.length < 2) {
+    showError("Need at least two owned Pokémon.");
+    return;
+  }
+  showError("");
+  const btn = $("buildRoster");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/recommend", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        seeds: [],
+        auto_roster: true,
+        roster,
+        max_megas: maxMegasFromForm(),
+        top_n: 8,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showError(data.error || "Could not build from roster.");
+      return;
+    }
+    render(data);
+  } catch (err) {
+    showError(String(err));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+if ($("buildRoster")) $("buildRoster").addEventListener("click", buildFromRoster);
 
 waitForData();

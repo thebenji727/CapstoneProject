@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Champions VGC Team Checker</title>
-  <link rel="stylesheet" href="/style.css?v=mc-moves2" />
+  <link rel="stylesheet" href="/style.css?v=blacknames" />
 </head>
 <body>
   <main class="page">
@@ -13,6 +13,19 @@
       <p class="lede">Champions VGC Regulation M-C. Pick 1–6 Pokémon. Empty slots get filled; a full team just gets sets and a paste.</p>
       <p id="status" class="status">Loading battle data…</p>
     </header>
+
+    <section class="roster-box">
+      <h2 class="subheader">Your Champions roster</h2>
+      <p class="hint">Drop a Champions box screenshot. Icon pages have no names, so the scan pulls each sprite and skips red-slash locks. Type a name under each icon, then add them.</p>
+      <div id="drop" class="drop">Drop screenshots here, or click to choose</div>
+      <input id="shots" type="file" accept="image/*" multiple hidden />
+      <textarea id="rosterText" rows="3" placeholder="Or paste names: Rillaboom, Indeedee, Garchomp"></textarea>
+      <button type="button" id="scan">Scan roster</button>
+      <div id="iconLabels" class="icon-grid"></div>
+      <button type="button" id="addLabeled">Add labeled sprites</button>
+      <button type="button" id="buildRoster">Build best team from roster</button>
+      <div id="rosterList" class="grid chips"></div>
+    </section>
 
     <form id="builder" autocomplete="off">
       <div class="seed-grid">
@@ -127,6 +140,6 @@
       </div>
     </section>
   </main>
-  <script src="/app.js?v=threats2"></script>
+  <script src="/app.js?v=meta1"></script>
 </body>
 </html>
