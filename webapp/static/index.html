@@ -16,14 +16,15 @@
 
     <section class="roster-box">
       <h2 class="subheader">Your Champions roster</h2>
-      <p class="hint">Drop a Champions box screenshot. Icon pages have no names, so the scan pulls each sprite and skips red-slash locks. Type a name under each icon, then add them.</p>
-      <div id="drop" class="drop">Drop screenshots here, or click to choose</div>
+      <p class="hint">Drop several Champions box screenshots, then scan. Blank sprite boxes are skipped. Build uses names you already saved.</p>
+      <div id="drop" class="drop">Drop screenshots here, or click to choose several</div>
       <input id="shots" type="file" accept="image/*" multiple hidden />
       <textarea id="rosterText" rows="3" placeholder="Or paste names: Rillaboom, Indeedee, Garchomp"></textarea>
       <button type="button" id="scan">Scan roster</button>
       <div id="iconLabels" class="icon-grid"></div>
       <button type="button" id="addLabeled">Add labeled sprites</button>
       <button type="button" id="buildRoster">Build best team from roster</button>
+      <button type="button" id="forgetRoster">Forget saved roster</button>
       <div id="rosterList" class="grid chips"></div>
     </section>
 
@@ -140,6 +141,6 @@
       </div>
     </section>
   </main>
-  <script src="/app.js?v=meta1"></script>
+  <script src="/app.js?v=memory4"></script>
 </body>
 </html>

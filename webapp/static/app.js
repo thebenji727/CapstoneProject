@@ -7,6 +7,8 @@ const errorEl = $("error");
 const go = $("go");
 let roster = [];
 let shotFiles = [];
+const ROSTER_KEY = "vgc-owned-roster";
+const SPRITE_KEY = "vgc-sprite-names";
 
 function showError(msg) {
   errorEl.hidden = !msg;
@@ -402,19 +404,84 @@ $("copy").addEventListener("click", async () => {
   }
 });
 
-function renderIconLabels(icons) {
+function loadRoster() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(ROSTER_KEY) || "[]");
+    roster = Array.isArray(saved) ? saved.filter(Boolean) : [];
+  } catch {
+    roster = [];
+  }
+}
+
+function saveRoster() {
+  localStorage.setItem(ROSTER_KEY, JSON.stringify(roster));
+}
+
+function spriteNames() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SPRITE_KEY) || "{}");
+    return saved && typeof saved === "object" ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberSprite(key, name) {
+  if (!key || !name) return;
+  const map = spriteNames();
+  map[key] = name;
+  localStorage.setItem(SPRITE_KEY, JSON.stringify(map));
+}
+
+function iconKey(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 8;
+      canvas.height = 8;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, 8, 8);
+      const data = ctx.getImageData(0, 0, 8, 8).data;
+      let key = "";
+      for (let i = 0; i < data.length; i += 4) {
+        key += (data[i] >> 5).toString(16) + (data[i + 1] >> 5).toString(16) + (data[i + 2] >> 5).toString(16);
+      }
+      resolve(key);
+    };
+    img.onerror = () => resolve("");
+    img.src = dataUrl;
+  });
+}
+
+function renderIconLabels(icons, {append = false} = {}) {
   let box = $("iconLabels");
   if (!box) return;
   if (!icons.length) {
-    box.innerHTML = "";
+    if (!append) box.innerHTML = "";
     return;
   }
-  box.innerHTML = icons
+  const known = spriteNames();
+  const html = icons
     .map((icon, i) => `<label class="icon-label">
       <img src="${icon.image}" alt="" />
       <input list="dex" data-icon="${i}" placeholder="name" />
     </label>`)
     .join("");
+  if (append) box.insertAdjacentHTML("beforeend", html);
+  else box.innerHTML = html;
+  box.querySelectorAll(".icon-label").forEach(async (label) => {
+    const input = label.querySelector("input");
+    if (input.dataset.spriteKey) return;
+    const img = label.querySelector("img");
+    const key = await iconKey(img.src);
+    if (key) input.dataset.spriteKey = key;
+    const remembered = key && known[key];
+    if (remembered && !input.value) {
+      input.value = remembered;
+      input.placeholder = "remembered";
+    }
+  });
 }
 
 function addLabeledIcons() {
@@ -423,10 +490,13 @@ function addLabeledIcons() {
   const seen = new Set(roster.map((n) => n.toLowerCase()));
   box.querySelectorAll("input").forEach((input) => {
     const name = input.value.trim();
-    if (!name || seen.has(name.toLowerCase())) return;
+    if (!name) return;
+    rememberSprite(input.dataset.spriteKey, name);
+    if (seen.has(name.toLowerCase())) return;
     seen.add(name.toLowerCase());
     roster.push(name);
   });
+  saveRoster();
   renderRoster();
 }
 
@@ -442,6 +512,7 @@ function renderRoster() {
   box.querySelectorAll("[data-drop]").forEach((btn) => {
     btn.addEventListener("click", () => {
       roster = roster.filter((n) => n !== btn.dataset.drop);
+      saveRoster();
       renderRoster();
     });
   });
@@ -459,6 +530,8 @@ async function fileToData(file) {
 async function scanRoster() {
   showError("");
   const btn = $("scan");
+  const box = $("iconLabels");
+  if (box) box.innerHTML = "";
   if (btn) btn.disabled = true;
   try {
     const images = [];
@@ -481,7 +554,11 @@ async function scanRoster() {
       }
     }
     renderRoster();
+    saveRoster();
     renderIconLabels(data.icons || []);
+    shotFiles = [];
+    if (drop) drop.textContent = "Drop screenshots here, or click to choose several";
+    if (shots) shots.value = "";
     if (data.ocr) showError(data.ocr);
     else if (!roster.length && !(data.icons || []).length) {
       showError("No Pokémon names found. Crop to the box, or paste names.");
@@ -493,15 +570,29 @@ async function scanRoster() {
   }
 }
 
+function addShotFiles(files) {
+  const next = Array.from(files || []).filter((f) => f.type.startsWith("image/"));
+  const seen = new Set(shotFiles.map((f) => `${f.name}:${f.size}`));
+  for (const file of next) {
+    const key = `${file.name}:${file.size}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    shotFiles.push(file);
+  }
+  if (drop) {
+    drop.textContent = shotFiles.length
+      ? `${shotFiles.length} screenshot${shotFiles.length === 1 ? "" : "s"}: ` + shotFiles.map((f) => f.name).join(", ")
+      : "Drop screenshots here, or click to choose several";
+  }
+}
+
 const drop = $("drop");
 const shots = $("shots");
 if (drop && shots) {
   drop.addEventListener("click", () => shots.click());
   shots.addEventListener("change", () => {
-    shotFiles = Array.from(shots.files || []);
-    drop.textContent = shotFiles.length
-      ? shotFiles.map((f) => f.name).join(", ")
-      : "Drop screenshots here, or click to choose";
+    addShotFiles(shots.files);
+    shots.value = "";
   });
   drop.addEventListener("dragover", (ev) => {
     ev.preventDefault();
@@ -511,21 +602,24 @@ if (drop && shots) {
   drop.addEventListener("drop", (ev) => {
     ev.preventDefault();
     drop.classList.remove("over");
-    shotFiles = Array.from(ev.dataTransfer.files || []).filter((f) => f.type.startsWith("image/"));
-    drop.textContent = shotFiles.length
-      ? shotFiles.map((f) => f.name).join(", ")
-      : "Drop screenshots here, or click to choose";
+    addShotFiles(ev.dataTransfer.files);
   });
 }
 if ($("scan")) $("scan").addEventListener("click", scanRoster);
 if ($("addLabeled")) $("addLabeled").addEventListener("click", addLabeledIcons);
+if ($("forgetRoster")) {
+  $("forgetRoster").addEventListener("click", () => {
+    roster = [];
+    localStorage.removeItem(ROSTER_KEY);
+    localStorage.removeItem(SPRITE_KEY);
+    renderRoster();
+    showError("Saved roster cleared on this browser.");
+  });
+}
+loadRoster();
+renderRoster();
 
 async function buildFromRoster() {
-  const inputs = Array.from(document.querySelectorAll("#iconLabels input"));
-  if (inputs.length && inputs.some((input) => !input.value.trim())) {
-    showError("Fill every sprite name, then build.");
-    return;
-  }
   addLabeledIcons();
   const typed = (($("rosterText") && $("rosterText").value) || "")
     .split(/[\n,]/)
@@ -538,6 +632,7 @@ async function buildFromRoster() {
       roster.push(name);
     }
   }
+  saveRoster();
   renderRoster();
   if (roster.length < 2) {
     showError("Need at least two owned Pokémon.");

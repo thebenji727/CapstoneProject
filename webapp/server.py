@@ -398,7 +398,7 @@ def _match_roster_text(text: str, names: list[str]) -> list[str]:
 def _decode_images(images: list):
     from PIL import Image
     out = []
-    for item in images[:8]:
+    for item in images[:24]:
         raw = item.get("data") or item.get("image") if isinstance(item, dict) else item
         raw = str(raw or "")
         if "," in raw and raw.startswith("data:"):
@@ -411,11 +411,40 @@ def _decode_images(images: list):
     return out
 
 
+def _cluster_centers(values: list[int], gap: int) -> list[int]:
+    if not values:
+        return []
+    values = sorted(values)
+    groups = [[values[0]]]
+    for value in values[1:]:
+        if value - groups[-1][-1] <= gap:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return [sum(group) // len(group) for group in groups]
+
+
+def _cell_is_sprite(cell) -> bool:
+    colors = list(cell.resize((24, 24)).getdata())
+    reds = sum(1 for r, g, b in colors if r > 190 and r > g + 70 and r > b + 70)
+    if reds > 80:
+        return False
+    avg = tuple(sum(c[i] for c in colors) / len(colors) for i in range(3))
+    variance = sum(sum((c[i] - avg[i]) ** 2 for i in range(3)) for c in colors) / len(colors)
+    return variance >= 280
+
+
+def _icon_payload(cell) -> dict:
+    thumb = cell.resize((72, 72))
+    buf = io.BytesIO()
+    thumb.save(buf, format="PNG")
+    return {"image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()}
+
+
 def _extract_box_icons(img) -> list[dict]:
     """Pull Champions box cells. Names are not printed on this screen."""
-    from PIL import Image
     work = img.copy()
-    work.thumbnail((1100, 1100))
+    work.thumbnail((1400, 1400))
     w, h = work.size
     px = work.load()
     mask = [[False] * w for _ in range(h)]
@@ -446,30 +475,61 @@ def _extract_box_icons(img) -> list[dict]:
                         seen[ny][nx] = True
                         stack.append((nx, ny))
             bw, bh = maxx - minx + 1, maxy - miny + 1
-            if n > 220 and 0.7 <= bw / max(bh, 1) <= 1.4 and 34 < bw < 150:
+            if n > 180 and 0.65 <= bw / max(bh, 1) <= 1.5 and 30 < bw < 180:
                 boxes.append((minx, miny, maxx, maxy))
+    if len(boxes) >= 4:
+        widths = [b[2] - b[0] for b in boxes]
+        heights = [b[3] - b[1] for b in boxes]
+        pitch_x = sorted(widths)[len(widths) // 2] + 8
+        pitch_y = sorted(heights)[len(heights) // 2] + 8
+        cols = _cluster_centers([(b[0] + b[2]) // 2 for b in boxes], max(18, pitch_x // 2))
+        rows = _cluster_centers([(b[1] + b[3]) // 2 for b in boxes], max(18, pitch_y // 2))
+        if len(cols) >= 2 and len(rows) >= 2:
+            step_x = sorted(cols[i + 1] - cols[i] for i in range(len(cols) - 1))[len(cols) // 2]
+            step_y = sorted(rows[i + 1] - rows[i] for i in range(len(rows) - 1))[len(rows) // 2]
+            half_w = sorted(widths)[len(widths) // 2] // 2
+            half_h = sorted(heights)[len(heights) // 2] // 2
+            filled = {(min(range(len(cols)), key=lambda i: abs(cols[i] - (b[0] + b[2]) // 2)),
+                       min(range(len(rows)), key=lambda i: abs(rows[i] - (b[1] + b[3]) // 2)))
+                      for b in boxes}
+            for r in range(len(rows)):
+                for c in range(len(cols)):
+                    if (c, r) in filled:
+                        continue
+                    cx, cy = cols[c], rows[r]
+                    if abs(cx - cols[0]) % max(step_x, 1) > step_x * 0.35 and c not in range(len(cols)):
+                        continue
+                    box = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+                    if box[0] < 0 or box[1] < 0 or box[2] >= w or box[3] >= h:
+                        continue
+                    boxes.append(box)
+    boxes.sort(key=lambda b: ((b[2] - b[0]) * (b[3] - b[1])), reverse=True)
+    kept = []
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        area = max(1, (x2 - x1) * (y2 - y1))
+        overlap = False
+        for ox1, oy1, ox2, oy2 in kept:
+            ix = max(0, min(x2, ox2) - max(x1, ox1))
+            iy = max(0, min(y2, oy2) - max(y1, oy1))
+            if ix * iy / area > 0.45:
+                overlap = True
+                break
+        if not overlap:
+            kept.append(box)
+    boxes = sorted(kept, key=lambda b: (b[1], b[0]))
     icons = []
+    seen_thumbs = set()
     for minx, miny, maxx, maxy in boxes:
-        cell = work.crop((minx, miny, maxx + 1, maxy + 1))
-        colors = list(cell.resize((24, 24)).getdata())
-        reds = sum(1 for r, g, b in colors if r > 190 and r > g + 70 and r > b + 70)
-        # Ban icon is a red circle-slash. Orange sprites stay under this count.
-        if reds > 80:
+        cell = work.crop((max(0, minx), max(0, miny), min(w, maxx + 1), min(h, maxy + 1)))
+        if cell.width < 20 or cell.height < 20 or not _cell_is_sprite(cell):
             continue
-        variance = 0
-        avg = tuple(sum(c[i] for c in colors) / len(colors) for i in range(3))
-        variance = sum(sum((c[i] - avg[i]) ** 2 for i in range(3)) for c in colors) / len(colors)
-        if variance < 400:
+        payload = _icon_payload(cell)
+        if payload["image"] in seen_thumbs:
             continue
-        thumb = cell.resize((72, 72))
-        buf = io.BytesIO()
-        thumb.save(buf, format="PNG")
-        icons.append(
-            {
-                "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
-            }
-        )
-        if len(icons) >= 48:
+        seen_thumbs.add(payload["image"])
+        icons.append(payload)
+        if len(icons) >= 60:
             break
     return icons
 
@@ -496,7 +556,7 @@ def _scan_images(images: list, names: list[str]) -> tuple[list[str], str, list[d
         note = f"Found {len(icons)} box icons. This screen has no names, so label the sprites below. Red-slash locks were skipped."
     elif not icons and not matched:
         note = "No names or box icons found. Crop to the Champions box and try again, or paste names."
-    return matched, note or text[:400], icons[:48]
+    return matched, note or text[:400], icons[:80]
 
 
 def _roster_from(payload: dict) -> list[str]:
