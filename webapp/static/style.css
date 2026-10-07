@@ -452,6 +452,40 @@ section { margin-top: 22px; }
   color: #111 !important;
 }
 
+#rosterList {
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+
+#rosterList button.chip {
+  height: auto;
+  min-height: 84px;
+  margin-top: 0;
+  padding: 12px 14px;
+  align-items: center;
+  gap: 12px;
+  background: var(--card);
+  color: #111;
+}
+
+#rosterList .art-wrap,
+#rosterList .sprite.sm {
+  flex: 0 0 64px;
+  width: 64px;
+  height: 64px;
+}
+
+#rosterList .name {
+  font-size: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#rosterList .meta {
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
 @media (max-width: 760px) {
   .page { padding: 24px 14px 64px; }
   .seed-grid,

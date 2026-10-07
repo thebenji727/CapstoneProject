@@ -18,6 +18,7 @@ import time
 import io
 import json
 import re
+import shutil
 import sys
 import threading
 import traceback
@@ -38,6 +39,7 @@ import team_recs as recs  # noqa: E402
 STATE = {
     "ready": False,
     "error": None,
+    "refresh_error": None,
     "corpus": None,
     "pastes": None,
     "names": [],
@@ -175,18 +177,62 @@ STALE_SNAPSHOTS = (
 )
 
 
+def _cache_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "data" / "cache"
+
+
+def _snapshot_paths() -> list[Path]:
+    cache = _cache_dir()
+    return [cache / name for name in STALE_SNAPSHOTS]
+
+
+def _backup_snapshots() -> list[tuple[Path, Path]]:
+    """Copy fallback snapshots aside before a forced refresh deletes them."""
+    backed: list[tuple[Path, Path]] = []
+    for path in _snapshot_paths():
+        if not path.is_file():
+            continue
+        bak = path.with_name(path.name + ".bak")
+        shutil.copy2(path, bak)
+        backed.append((path, bak))
+    return backed
+
+
+def _restore_snapshots(backed: list[tuple[Path, Path]]) -> None:
+    for path, bak in backed:
+        if bak.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(bak, path)
+
+
+def _discard_backups(backed: list[tuple[Path, Path]]) -> None:
+    for _, bak in backed:
+        if bak.is_file():
+            bak.unlink()
+
+
 def _drop_stale_snapshots() -> None:
     """Force the next load to pull usage, cups, and new official events."""
-    cache = Path(__file__).resolve().parent.parent / "data" / "cache"
-    for name in STALE_SNAPSHOTS:
-        path = cache / name
+    for path in _snapshot_paths():
         if path.is_file():
             path.unlink()
 
 
+def _corpus_empty(corpus) -> bool:
+    try:
+        return len(corpus) == 0
+    except TypeError:
+        return corpus is None
+
+
 def _load(*, refresh: bool = False) -> None:
+    backups: list[tuple[Path, Path]] = []
     try:
         if refresh:
+            # Loader falls back to these files when a source is down. Delete
+            # them only after a copy exists, and put the copy back if the
+            # fetch fails or comes back empty.
+            backups = _backup_snapshots()
             _drop_stale_snapshots()
         corpus, pastes = recs.load_teambuilder_data(
             include_worlds=True,
@@ -196,12 +242,15 @@ def _load(*, refresh: bool = False) -> None:
             include_usage=True,
             include_sample_pastes=True,
         )
+        if refresh and _corpus_empty(corpus):
+            raise RuntimeError("refresh returned an empty corpus")
         corpus._ensure_index()
         names = sorted({disp for disp in corpus._by_key.values()}, key=str.casefold)
         with LOCK:
             STATE.update(
                 ready=True,
                 error=None,
+                refresh_error=None,
                 corpus=corpus,
                 pastes=pastes,
                 names=names,
@@ -209,10 +258,20 @@ def _load(*, refresh: bool = False) -> None:
                 weight=corpus.total_weight,
                 updated=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             )
+        _discard_backups(backups)
     except Exception as exc:
+        if backups:
+            _restore_snapshots(backups)
+        message = f"{type(exc).__name__}: {exc}"
+        traceback.print_exc()
         with LOCK:
-            STATE["ready"] = False
-            STATE["error"] = f"{type(exc).__name__}: {exc}"
+            # A bad refresh must not take down a corpus we are already serving.
+            if refresh and STATE.get("corpus") is not None and STATE.get("ready"):
+                STATE["refresh_error"] = message
+            else:
+                STATE["ready"] = False
+                STATE["error"] = message
+                STATE["refresh_error"] = message
 
 
 def _refresh_loop() -> None:
@@ -648,6 +707,22 @@ def _best_roster_core(corpus, roster: list[str], max_megas: int) -> list[str]:
     return best
 
 
+
+def _max_megas_from(payload: dict) -> int:
+    """0 means no cap. Missing means the UI default of 2. Do not treat 0 as missing."""
+    max_megas = payload.get("max_megas")
+    if max_megas is None:
+        one_mega = payload.get("one_mega")
+        if one_mega is None:
+            return 2
+        return 1 if bool(one_mega) else 0
+    try:
+        parsed = int(max_megas)
+    except (TypeError, ValueError):
+        return 2
+    return 0 if parsed < 0 else parsed
+
+
 def _recommend(payload: dict) -> dict:
     with LOCK:
         if not STATE["ready"]:
@@ -655,28 +730,18 @@ def _recommend(payload: dict) -> dict:
         corpus = STATE["corpus"]
         pastes = STATE["pastes"]
 
+    max_megas = _max_megas_from(payload)
     seeds = _seeds_from(payload)
     roster = _roster_from(payload)
     if not seeds and roster:
         if len(roster) < 2:
             return {"ok": False, "error": "Label at least two owned Pokémon first."}
-        seeds = _best_roster_core(corpus, roster, int(payload.get("max_megas") or 2))
+        seeds = _best_roster_core(corpus, roster, max_megas)
         if not seeds:
             return {"ok": False, "error": "None of the labeled names are in the current format data."}
     if not seeds:
         return {"ok": False, "error": "Pick at least one Pokémon."}
 
-    max_megas = payload.get("max_megas")
-    if max_megas is None:
-        one_mega = payload.get("one_mega")
-        if one_mega is None:
-            max_megas = 2
-        else:
-            max_megas = 1 if bool(one_mega) else 0
-    else:
-        max_megas = int(max_megas)
-        if max_megas < 0:
-            max_megas = 0
     top_n = int(payload.get("top_n") or 8)
 
     resolved = [
@@ -827,6 +892,7 @@ class Handler(SimpleHTTPRequestHandler):
                     {
                         "ready": STATE["ready"],
                         "error": STATE["error"],
+                        "refresh_error": STATE.get("refresh_error"),
                         "teams": STATE["teams"],
                         "weight": STATE["weight"],
                         "pokemon": len(STATE["names"]),
